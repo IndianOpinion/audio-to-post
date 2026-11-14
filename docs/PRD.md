@@ -356,7 +356,7 @@ Allowed transitions: `new` to `fetching`, `failed`, `cancelled`;
     worst case). The editor sees "up to N output tokens". The settings
     screen explains that scripts other than Latin often need a higher
     tokens-per-word figure, and the operator can set it per language
-    (open question 9).
+    (open question 8).
 30. **Price.** Prices are never shipped. The operator may enter, per
     transcription adapter, a price per audio minute, and per draft model a
     price per million input tokens and per million output tokens, each as a
@@ -414,8 +414,9 @@ Allowed transitions: `new` to `fetching`, `failed`, `cancelled`;
     step is requested, the estimate shows only draft tokens and still needs
     confirmation.
 40. **Estimate expiry.** An estimate not confirmed within 24 hours (filterable)
-    moves the run to `expired` and deletes the private audio copy. The
-    editor can re-estimate, which re-fetches URL sources.
+    moves the run to `expired`. Its private audio copy follows the audio
+    retention rule in case 80. The editor can re-estimate, which re-fetches
+    URL sources unless the copy is still held.
 41. **Authentication and account errors.** HTTP 401 or 403 from the
     provider, or a documented "insufficient credit" or "quota exhausted"
     error, does not retry. The run moves to `failed` with `provider_auth`
@@ -531,8 +532,8 @@ Allowed transitions: `new` to `fetching`, `failed`, `cancelled`;
     remaining cost and confirms again.
 61. **Cancel.** "Cancel" sets a cancel flag. No new call starts after it.
     A call in flight completes, its usage is recorded, its result is
-    discarded. The run moves to `cancelled`, the private audio is deleted,
-    the transcript so far is kept for the retention period and can be
+    discarded. The run moves to `cancelled`, its private audio follows the
+    audio retention rule in case 80, the transcript so far is kept for the retention period and can be
     exported. A cancelled run cannot be resumed; the editor starts a new
     one, and duplicate detection (case 7) reuses nothing because no full
     transcript exists.
@@ -552,7 +553,7 @@ Allowed transitions: `new` to `fetching`, `failed`, `cancelled`;
     (default 60 000 estimated tokens) uses two passes: first a short notes
     object per block of about 20 minutes (key points, candidate quote
     segment ids, topic starts), then the final draft from the notes plus
-    the selected quote segments in full (open question 6).
+    the selected quote segments in full (open question 5).
 63. **What the model is asked for.** The prompt is generic and fully
     replaceable (section 7). It must ask the model to: write only from the
     transcript; attribute every quote to the speaker label in the
@@ -586,8 +587,9 @@ Allowed transitions: `new` to `fetching`, `failed`, `cancelled`;
 
     `topics` is required for `show_notes` and optional otherwise.
     `speaker_names` is optional and is only ever a suggestion (case 68).
-    The call goes through `indianopinion/llm-json-php` with this schema,
-    so malformed or truncated JSON is retried there.
+    The call goes through the caller in cases 84 and 85 with this schema.
+    Malformed or truncated JSON is retried there, or, for a site caller,
+    rejected and retried by the plugin within the attempt limit.
 64. **Draft step failure.** If the model call fails after its retries, the
     run returns to `transcript_ready` with the error shown. The transcript
     is not affected. The editor may retry the draft.
@@ -699,15 +701,64 @@ Allowed transitions: `new` to `fetching`, `failed`, `cancelled`;
 
 ### 4.15 Retention and clean-up
 
-80. **Audio copies.** The private audio copy and chunk files are deleted as
-    soon as the run reaches `transcript_ready`, `empty`, `cancelled` or
-    `expired`, unless `keep_recording_hours` (default 0) says to keep them.
-    A `failed` run keeps its copy for 7 days for a retry, then deletes it.
+80. **Audio copies.** The private audio copy and chunk files are deleted
+    only by the operator's audio retention settings, never by any other
+    path and never silently. Two settings apply. `keep_recording_hours`
+    (default 0) is how long a copy is kept after its run reaches
+    `transcript_ready`, `empty`, `cancelled` or `expired`; 0 means delete
+    as soon as the run reaches one of those states. `keep_failed_hours`
+    (default 168) is the same for a `failed` run, so a retry can still use
+    the copy. A copy is never deleted while its run is in a non-final state.
+    Each file's due time is stored when its run reaches the state that
+    starts the clock, and the daily event and the end of every tick delete
+    files whose due time has passed. Nothing else removes audio: not a
+    cancel, not an expiry, not a retry, not an editor deleting a run.
+    Deleting a run by hand or by case 81 hands its files to the same rule
+    with the due time already computed.
 81. **Runs and transcripts.** Runs and their transcripts are kept for
     `retention_days` (default 90; 0 means keep for ever). A daily event
     deletes older runs that are in a final state. Drafts are never deleted.
-82. **Orphans.** The daily event also deletes files in the private directory
-    that no run references and that are older than 24 hours.
+82. **Orphans.** A private file that no run references is not deleted on
+    sight. It is listed on the status screen as an orphan and is deleted
+    under `keep_recording_hours`, counted from the file's last change and
+    never earlier than 24 hours after it, so an upload in progress is not
+    removed.
+83. **Deletions are visible.** Every deletion of an audio file writes a log
+    line on the run (or on the status screen for an orphan) with the file's
+    size, the time, and the setting and due time that caused it, and fires
+    `audiopost_recording_deleted`. The settings screen states the current
+    retention values next to the recordings fields. A file that cannot be
+    deleted is retried at the next daily event and shown on the status
+    screen. The `purge` command (section 5.6) applies the same rule early
+    and never deletes a file that is not yet due.
+
+### 4.16 Draft model caller
+
+84. **Default caller.** Every model call in the draft step (single pass,
+    notes pass and final pass) goes through `indianopinion/llm-json-php`,
+    which validates the reply against the case 63 schema and retries
+    malformed or truncated JSON. It is a required runtime dependency of
+    this plugin, listed in `composer.json` as a `vcs` repository entry and
+    never bundled in the repository. Provider and model are the operator's
+    settings.
+85. **Site-supplied caller.** The filter `audiopost_llm_caller` receives
+    `null` and an `array $context` (mode, pass, run id, schema, model
+    setting). A site may return a callable
+    `function (array $request, array $context): array|\WP_Error`. The
+    `$request` holds the prompt text, the schema and the output token
+    limit. The return value is the decoded JSON reply plus the usage
+    (`tokens_in`, `tokens_out`). When a valid callable is returned, the
+    plugin uses it for every model call of that run and does not call
+    `llm-json-php`. The plugin still validates the reply against the
+    schema, applies cases 66 to 68, records usage, and respects the
+    estimate, caps, kill switch and spend-meter exactly as for the default
+    caller. A non-callable result is ignored and logged once.
+86. **Run without the dependency.** When `llm-json-php` is not installed,
+    the plugin loads and works. The modes `article` and `show_notes` need a
+    caller: until the filter supplies one, they are shown as unavailable
+    with the reason `no_llm_caller`. The `transcript` mode, the
+    transcription adapters and every export keep working. The plugin never
+    falls back to a hidden built-in HTTP client.
 
 ## 5. Public interface
 
@@ -812,6 +863,7 @@ Bundled adapters:
 | `audiopost_usage_recorded` | `array $record` (section 6.4) |
 | `audiopost_cap_reached` | `string $unit, string $used, string $cap, string $day` |
 | `audiopost_kill_switch_changed` | `bool $old, bool $new, string $actor` |
+| `audiopost_recording_deleted` | `?Run $run, string $file_id, int $bytes, string $reason` (case 83) |
 
 ### 5.5 Filters
 
@@ -830,6 +882,7 @@ Bundled adapters:
 | `audiopost_tick_seconds` | 25 | case 74 |
 | `audiopost_estimate_ttl` | 86400 | case 40 |
 | `audiopost_retention_days` | setting | case 81 |
+| `audiopost_llm_caller` | null | `null\|callable $caller, array $context`; cases 85 and 86 |
 | `audiopost_allowed_hosts` | empty (all public hosts) | optional allow-list for URL sources |
 
 Every filter result is validated. An invalid type is ignored with a log
@@ -850,7 +903,7 @@ line, and the default is used.
 | `wp audio-to-post draft <run> --mode=<m>` | case 65 |
 | `wp audio-to-post export <run> --format=<f> [--original]` | to standard output |
 | `wp audio-to-post disable` / `enable` | kill switch |
-| `wp audio-to-post purge [--dry-run]` | retention clean-up now |
+| `wp audio-to-post purge [--dry-run]` | apply retention now: only files and runs already due (cases 80 to 83) |
 
 Exit codes: 0 success; 1 error; 3 stopped by the kill switch; 4 stopped by
 a cap. `add` without `--rights-confirmed` fails for audio sources.
@@ -901,7 +954,7 @@ nonce.
 3. **Usage ledger** is one option per local day, `audiopost_usage_<Y-m-d>`,
    not autoloaded, holding running totals, updated with an atomic
    compare-and-swap loop; days older than 400 are deleted by the daily
-   event. A table is not needed for these volumes (open question 8).
+   event. A table is not needed for these volumes (open question 7).
 4. **Private files** live in `wp-content/uploads/audio-to-post/` with a
    random 32-character hex name per file, an `index.php` and an
    `.htaccess` that denies all. The README tells nginx users to add a deny
@@ -914,8 +967,11 @@ nonce.
 
 Retention is section 4.15. Deactivation clears scheduled events only.
 `uninstall.php` deletes: all `audiopost_run` posts and their meta, the
-options above, the per-day usage options, the private directory and its
-contents, and the `_audiopost_*` meta on drafts. It does not delete draft
+options above, the per-day usage options and the `_audiopost_*` meta
+on drafts. It deletes the private audio directory only when the operator
+has ticked "Remove audio copies on uninstall" (default off, shown with
+the retention settings); otherwise the files stay and the README
+says where they are. It does not delete draft
 posts or attachments, because the editor created or kept them. On
 multisite it does this for every site.
 
@@ -987,7 +1043,9 @@ when the provider reports it as billed.
 | Async timeout | 6 h | |
 | Max parallel runs | 1 | |
 | Estimate expiry | 24 h | |
-| Keep audio after transcript | 0 h | |
+| Keep audio after transcript | 0 h | `keep_recording_hours`; 0 deletes at once when the run is final, case 80 |
+| Keep audio after a failed run | 168 h | `keep_failed_hours` |
+| Remove audio copies on uninstall | off | section 6.2 |
 | Retention | 90 days | 0 keeps for ever |
 
 The prompt for each mode and pass is shown on the settings screen as a
@@ -1016,15 +1074,17 @@ left as typed and logged once.
    shows the last 4 characters), never logged, never in exports, and
    stripped from any error message or response excerpt the plugin stores.
 5. **Private audio.** Audio copies are not attachments and are not
-   reachable by URL (section 6.1 item 4). They are deleted on the schedule
-   in 4.15.
+   reachable by URL (section 6.1 item 4). They are deleted only under the
+   operator's retention settings in 4.15, and every deletion is logged.
 6. **Personal data.** Recordings and transcripts may hold personal data.
    The plugin sends audio only to the provider the operator configured and
    transcript text only to the model the operator configured. The plugin
    adds a suggested paragraph to the WordPress privacy policy guide. It
    registers personal data exporter and eraser callbacks for runs created
    by a user (run metadata and transcripts they created); erasure deletes
-   those runs but not published or draft posts.
+   those runs but not published or draft posts. It does not delete audio
+   copies on its own; it reports each copy still held and its due time,
+   and the operator may lower the retention setting or use `purge`.
 7. **Model output.** Model text is treated as untrusted plain text: escaped
    on output, no HTML kept, no shortcodes run, links not made clickable.
    Quote and speaker checks are in cases 66 and 68.
@@ -1053,8 +1113,9 @@ left as typed and logged once.
 - PHP 8.1, 8.2, 8.3. `declare(strict_types=1)` in every library file.
 - WordPress 6.4 or later, single site and multisite (per site).
 - Runtime dependency: `indianopinion/llm-json-php` for the draft model call
-  (bundled in the release zip; Composer `vcs` repository until it is on
-  Packagist). No other runtime dependency; no SDKs.
+  (Composer `vcs` repository until it is on Packagist; never bundled in
+  the repository). A site may replace it through `audiopost_llm_caller`
+  (cases 84 to 86). No other runtime dependency; no SDKs.
 - Works with the block editor; with the classic editor the draft is still
   valid post content (blocks degrade to HTML).
 - Object caches: the kill switch, caps and locks use fresh reads (direct
@@ -1137,7 +1198,7 @@ WordPress stub layer.
 | T37 | 37 | 429 with `Retry-After: 30` schedules the retry at 30 s |
 | T38 | 38 | 413 splits the chunk and lowers the stored limit; under 60 s still refused fails the run |
 | T39 | 39 | transcript-file run with no draft skips confirmation |
-| T40 | 40 | unconfirmed after the TTL moves to `expired` and deletes the copy |
+| T40 | 40 | unconfirmed after the TTL moves to `expired`; the copy is kept until its retention due time |
 | T41 | 41 | 401 fails the run and pauses other runs on the adapter for 30 min with one notice |
 | T42 | 42 | refusal fails the run and keeps other chunks |
 | T43 | 43 | language hint is passed when supported; per-segment language stored |
@@ -1158,7 +1219,7 @@ WordPress stub layer.
 | T58 | 58 | deactivate then reactivate resumes from the last stored chunk |
 | T59 | 59 | permanent chunk failure keeps finished chunks |
 | T60 | 60 | retry of a failed run sends only missing chunks |
-| T61 | 61 | cancel during a call: result discarded, usage recorded, copy deleted |
+| T61 | 61 | cancel during a call: result discarded, usage recorded, copy deleted only when its retention due time passes |
 | T62 | 62 | `transcript` mode makes no model call; long transcript uses two passes |
 | T63 | 63 | model request carries the schema; malformed JSON retried by the library |
 | T64 | 64 | draft failure returns to `transcript_ready` with the transcript intact |
@@ -1177,11 +1238,15 @@ WordPress stub layer.
 | T77 | 77 | speaker merge, segment split and text fix saved; original unchanged; stale revision gets 409 |
 | T78 | 78 | exports match golden files for JSON, WebVTT voice tags, SRT and text |
 | T79 | 79 | malformed cues skipped and counted; file with none fails `transcript_unreadable`; 11 MB file refused |
-| T80 | 80 | audio deleted at `transcript_ready`; failed run keeps it 7 days |
+| T80 | 80 | with 0 hours the copy goes when the run is final; with 48 hours it stays until due; failed run keeps it for `keep_failed_hours`; nothing deletes a copy of a non-final run; cancel, expiry and deleting a run delete no audio early |
 | T81 | 81 | runs older than retention deleted, drafts kept |
-| T82 | 82 | unreferenced private files older than 24 h deleted |
+| T82 | 82 | an unreferenced file is listed as an orphan and deleted only when due and older than 24 h |
 | T83 | 8.4 | keys never appear in logs, exports or stored error excerpts |
 | T84 | 6.2 | uninstall removes runs, options, usage, private files and link meta, and keeps drafts and attachments |
+| T85 | 83 | each deletion logs size, time and cause and fires the action; a failed deletion is retried and shown; `purge` skips files not yet due |
+| T86 | 84 | draft calls go through the llm-json-php transport and the reply is schema-checked |
+| T87 | 85 | a callable from `audiopost_llm_caller` is used for the whole run, with the same estimate, caps, kill switch and usage record; a non-callable is ignored and logged once |
+| T88 | 86 | without llm-json-php the plugin loads, `article` and `show_notes` show `no_llm_caller`, and `transcript` mode and exports work |
 
 ## 13. Open questions
 
@@ -1198,21 +1263,18 @@ To be answered by the builder in `docs/ARCHITECTURE.md`.
 4. Post meta per chunk against a file per transcript: at what transcript
    size does post meta become a problem on common hosts (`max_allowed_packet`),
    and should large transcripts move to a private JSON file?
-5. Is `indianopinion/llm-json-php` acceptable as the one runtime dependency
-   for this repo, or should the draft step use the WordPress HTTP API
-   directly behind a small model adapter?
-6. What block size and notes shape work best for the two-pass draft on
+5. What block size and notes shape work best for the two-pass draft on
    long recordings (case 62)?
-7. Should HTML episode pages be supported by reading only a declared
+6. Should HTML episode pages be supported by reading only a declared
    `<link rel="alternate" type="application/rss+xml">` or an `og:audio`
    tag, or stay refused (current rule)?
-8. Is one option per day enough for the usage ledger, or should usage go
+7. Is one option per day enough for the usage ledger, or should usage go
    in a small table for reporting across months?
-9. Which default tokens-per-word figures should ship per script, given
+8. Which default tokens-per-word figures should ship per script, given
    that the repo must not ship prices but may ship ratios, and how should
    the operator measure their own?
-10. Should the transcript screen allow audio playback synced to segments
-    (needs the audio kept), given that the default deletes the audio copy?
+9. Should the transcript screen allow audio playback synced to segments
+    (needs the audio kept), given that the default deletes the audio copy as soon as the run no longer needs it?
 
 ## 14. Lessons from production
 
@@ -1261,5 +1323,10 @@ generated text, and they bind the build.
 14. **Normalise text before comparing it.** Unicode NFC, case folding and
     quote unification before any quote or seam match, or non-Latin text
     and typographic quotes fail to match.
-15. **Delete what you copied.** Private audio copies are removed as soon as
-    they are not needed; orphans are swept daily.
+15. **Delete what you copied, only when the operator said so.** Private
+    audio copies are removed under the operator's retention settings and
+    never silently: every deletion is logged and fires an action. Nothing
+    else, including a cancel or an expiry, deletes audio early.
+16. **Let a site bring its own model caller.** A required dependency is
+    acceptable only with a filter that lets a site replace it, and the
+    plugin must still load and keep non-model features working without it.
