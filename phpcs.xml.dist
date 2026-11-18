@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<ruleset name="audio-to-post">
+    <description>PSR-12 for the plugin and its tests.</description>
+    <file>src</file>
+    <file>tests</file>
+    <file>audio-to-post.php</file>
+    <file>bootstrap.php</file>
+    <file>uninstall.php</file>
+    <file>mu-loader</file>
+    <file>examples</file>
+    <exclude-pattern>vendor/*</exclude-pattern>
+    <exclude-pattern>tests/golden/*</exclude-pattern>
+    <arg name="extensions" value="php"/>
+    <arg name="colors"/>
+    <arg value="sp"/>
+    <rule ref="PSR12">
+        <!-- Long lines are allowed: SQL, messages and block markup read better unbroken. -->
+        <exclude name="Generic.Files.LineLength"/>
+    </rule>
+    <!-- The WordPress stub layer and the plugin entry files declare global functions and classes on purpose. -->
+    <rule ref="PSR1.Files.SideEffects">
+        <exclude-pattern>tests/stubs/*</exclude-pattern>
+        <exclude-pattern>tests/phpstan-constants.php</exclude-pattern>
+        <exclude-pattern>audio-to-post.php</exclude-pattern>
+        <exclude-pattern>bootstrap.php</exclude-pattern>
+        <exclude-pattern>uninstall.php</exclude-pattern>
+        <exclude-pattern>mu-loader/*</exclude-pattern>
+        <exclude-pattern>examples/*</exclude-pattern>
+        <exclude-pattern>src/functions.php</exclude-pattern>
+    </rule>
+    <rule ref="PSR1.Classes.ClassDeclaration.MultipleClasses">
+        <exclude-pattern>tests/stubs/*</exclude-pattern>
+    </rule>
+    <rule ref="PSR1.Classes.ClassDeclaration.MissingNamespace">
+        <exclude-pattern>tests/stubs/*</exclude-pattern>
+    </rule>
+    <rule ref="Squiz.Classes.ValidClassName.NotCamelCaps">
+        <exclude-pattern>tests/stubs/*</exclude-pattern>
+    </rule>
+    <rule ref="PSR1.Methods.CamelCapsMethodName.NotCamelCaps">
+        <exclude-pattern>tests/stubs/*</exclude-pattern>
+    </rule>
+</ruleset>
