@@ -21,7 +21,9 @@ final class TranscriptText
     {
         $out = [];
         foreach ($segments ?? $t->segments as $s) {
-            $out[] = '[' . $s->id . '] ' . $t->speakerDisplay($s->speaker) . ': ' . $s->text;
+            // One line per segment: text that holds line breaks cannot
+            // forge another segment id or speaker line in the prompt.
+            $out[] = '[' . $s->id . '] ' . self::oneLine($t->speakerDisplay($s->speaker)) . ': ' . self::oneLine($s->text);
         }
 
         return implode("\n", $out);
@@ -68,5 +70,10 @@ final class TranscriptText
     public static function speakerList(Transcript $t): string
     {
         return implode(', ', array_map(static fn ($s): string => $s->display(), $t->speakers));
+    }
+
+    private static function oneLine(string $text): string
+    {
+        return trim((string) preg_replace('/[\r\n\x{2028}\x{2029}]+/u', ' ', $text));
     }
 }

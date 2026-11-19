@@ -163,7 +163,7 @@ final class Plugin
 
     public function guard(): SpendGuard
     {
-        return $this->service('guard', SpendGuard::class, fn (): SpendGuard => new SpendGuard($this->settings(), $this->ledger(), $this->clock(), $this->repo()));
+        return $this->service('guard', SpendGuard::class, fn (): SpendGuard => new SpendGuard($this->settings(), $this->ledger(), $this->clock(), $this->repo(), $this->locks()));
     }
 
     public function locks(): Lock

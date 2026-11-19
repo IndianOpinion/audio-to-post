@@ -267,9 +267,8 @@ final class Runner
         }
         $path = $this->chunkPath($run, $chunk, $plan);
         if ($path === null) {
-            if ($reservation !== null) {
-                SpendMeter::release($reservation, 'source_copy_missing');
-            }
+            SpendMeter::release($reservation);
+            $this->p->guard()->settle($id);
 
             return 'stop';
         }
@@ -324,9 +323,7 @@ final class Runner
         }
         $repo->deleteMeta($id, 'inflight_' . $i);
         $usage = $this->recordUsage($id, 'transcribe', $adapter->id(), 'chunk ' . $i, $billed, 0, 0, $this->minuteMoney($adapter, $billed), $result->httpStatus, $attempt);
-        if (SpendMeter::present()) {
-            SpendMeter::record($reservation, ['purpose' => 'audio-to-post.transcribe', 'provider' => $adapter->id(), 'model' => $intent['model'], 'units' => round($billed / 60, 3)]);
-        }
+        SpendMeter::record($reservation, ['kind' => 'transcribe', 'provider' => $adapter->id(), 'model' => $intent['model'], 'status' => 'ok', 'http_status' => $result->httpStatus, 'seconds' => $billed, 'attempt' => $attempt, 'run_id' => $id]);
         $this->stats['calls']++;
         if ($cancelled) {
             $repo->log($id, 'chunk ' . $i . ' finished after cancel; result discarded, usage recorded');
@@ -355,9 +352,9 @@ final class Runner
         if ($billed > 0) {
             $this->recordUsage($id, 'transcribe', $adapter->id(), 'chunk ' . $i, $billed, 0, 0, $this->minuteMoney($adapter, $billed), $e->httpStatus(), $attempt);
         }
-        if ($reservation !== null) {
-            SpendMeter::release($reservation, $e->errorCode());
-        }
+        // The call reached the provider: record it, billed or not.
+        SpendMeter::record($reservation, ['kind' => 'transcribe', 'provider' => $adapter->id(), 'model' => $intent['model'], 'status' => $billed > 0 ? 'error_billed' : 'error_unbilled', 'http_status' => $e->httpStatus(), 'seconds' => $billed, 'attempt' => $attempt, 'error_code' => $e->errorCode(), 'run_id' => $id]);
+        $this->p->guard()->settle($id);
         $msg = Settings::redact($e->getMessage());
         $repo->log($id, sprintf('chunk %d failed: %s [%s, HTTP %s]', $i, $msg, $e->errorCode(), $e->httpStatus() ?? '-'));
         if ($e->retryable()) {
@@ -440,12 +437,16 @@ final class Runner
         $job = $repo->meta($id, 'async_' . $i);
         $intent = $this->intent($run, $adapter, $caps->billedSeconds($chunk->lengthMs()));
         if (!is_array($job)) {
-            $reservation = $this->authorize($run, $intent);
+            // The hold lasts while the provider job may run.
+            $reservation = $this->authorize($run, $intent, $this->p->settings()->int('async_timeout_hours') * 3600);
             if ($reservation === false) {
                 return 'stop';
             }
             $path = $this->chunkPath($run, $chunk, $plan);
             if ($path === null) {
+                SpendMeter::release($reservation);
+                $this->p->guard()->settle($id);
+
                 return 'stop';
             }
             $request = new ChunkRequest($path, $plan->format, $chunk->startMs, $chunk->lengthMs(), $caps->languageHint && $run->language() !== 'auto' ? $run->language() : null, 'run' . $id . '-c' . $i, $i);
@@ -461,9 +462,8 @@ final class Runner
         }
         $reservation = is_string($job['reservation'] ?? null) ? $job['reservation'] : null;
         if ($now - (int) ($job['submitted'] ?? $now) > $this->p->settings()->int('async_timeout_hours') * 3600) {
-            if ($reservation !== null) {
-                SpendMeter::release($reservation, ProviderException::TIMEOUT);
-            }
+            SpendMeter::record($reservation, ['kind' => 'transcribe', 'provider' => $adapter->id(), 'model' => $intent['model'], 'status' => 'error_unbilled', 'error_code' => ProviderException::TIMEOUT, 'run_id' => $id]);
+            $this->p->guard()->settle($id);
             $repo->move($id, RunState::FAILED, 'chunk ' . $i, ProviderException::TIMEOUT, 'The provider job did not finish in time.');
 
             return 'stop';
@@ -502,16 +502,19 @@ final class Runner
      *
      * @return string|null|false reservation id, null for none, false when stopped
      */
-    private function authorize(Run $run, array $intent): string|null|false
+    private function authorize(Run $run, array $intent, int $holdSeconds = Lock::TTL): string|null|false
     {
         $repo = $this->p->repo();
         try {
-            return $this->p->guard()->authorize($run, $intent);
+            return $this->p->guard()->authorize($run, $intent, $holdSeconds);
         } catch (DisabledException $e) {
             $this->pause($run->id, 'kill_switch', null);
             $this->stats['stopped'] = 'kill_switch';
         } catch (CapException $e) {
-            if ($e->errorCode() === 'daily_cap') {
+            if ($e->errorCode() === 'spend_busy') {
+                // Another run holds the spend check for a moment: try again next tick.
+                $this->stats['stopped'] ??= 'busy';
+            } elseif ($e->errorCode() === 'daily_cap') {
                 $this->pause($run->id, 'daily_cap', $this->p->clock()->nextLocalMidnight());
                 $this->stats['stopped'] = 'daily_cap';
             } else {
@@ -708,6 +711,7 @@ final class Runner
             'attempt' => $attempt,
         ]);
         $this->p->repo()->addUsage($runId, $record);
+        $this->p->guard()->settle($runId);
 
         return $record;
     }
@@ -721,13 +725,14 @@ final class Runner
                 continue;
             }
             $seconds = $caps->billedSeconds($c->lengthMs());
-            $jobId = GenQueue::enqueue([
-                'type' => GenQueue::CHUNK,
-                'idempotency_key' => $run->id . ':' . $c->index,
-                'payload' => ['run_id' => $run->id, 'chunk' => $c->index],
-                'estimate' => ['seconds' => $seconds, 'money_micros' => $this->minuteMoney($adapter, $seconds)],
-                'caller' => 'audio-to-post',
-            ]);
+            $money = $this->minuteMoney($adapter, $seconds);
+            // A job that failed in gen-queue (for example while this run was
+            // paused) is moved back to queued; a running one is left alone.
+            $args = ['idempotency_key' => 'run' . $run->id . '-c' . $c->index, 'on_conflict' => 'requeue', 'source' => 'audio-to-post'];
+            if ($money !== null) {
+                $args['cost_estimate'] = Money::format($money, 6);
+            }
+            $jobId = GenQueue::enqueue(GenQueue::CHUNK, ['run_id' => $run->id, 'chunk' => $c->index], $args);
             if ($jobId === null) {
                 $repo->setFlags($run->id, ['gen_queue_fallback' => true]);
                 $repo->log($run->id, 'gen-queue did not take the job; the plugin runner is used');
@@ -743,32 +748,40 @@ final class Runner
     }
 
     /**
-     * gen-queue job handler for `audio-to-post.chunk` and
-     * `audio-to-post.draft`.
-     *
-     * @param array<string, mixed> $job
-     * @param array<string, mixed> $context
+     * gen-queue job handler for `audio-to-post.chunk`. Receives gen-queue's
+     * Job and JobContext. It runs the chunk under the run lock with every
+     * check of case 33, reports the cost to the context (marked as metered
+     * when spend-meter already recorded it), and asks gen-queue to try
+     * again later when the run was busy.
      *
      * @return array<string, mixed>
+     *
+     * @throws \Throwable gen-queue's RetryableException when the chunk could not run yet
      */
-    public function handleJob(array $job, array $context = []): array
+    public function handleJob(mixed $job, mixed $context = null): array
     {
-        $payload = is_array($job['payload'] ?? null) ? $job['payload'] : $job;
+        $data = GenQueue::jobData($job);
+        $payload = $data['payload'];
         $runId = (int) ($payload['run_id'] ?? 0);
-        $before = count($this->p->repo()->usage($runId));
+        $chunk = (int) ($payload['chunk'] ?? 0);
+        $repo = $this->p->repo();
+        $before = count($repo->usage($runId));
         $this->deadline = microtime(true) + 600;
-        if (($job['type'] ?? '') === GenQueue::DRAFT) {
-            $this->processRun($runId);
-        } else {
-            $this->processRun($runId, (int) ($payload['chunk'] ?? 0));
-            $run = $this->p->repo()->get($runId);
-            if ($run !== null && $run->state === RunState::TRANSCRIBING && $run->plan !== null && $this->p->repo()->countResults($runId) >= $run->plan->count()) {
-                $this->stitch($runId);
+        $this->processRun($runId, $chunk);
+        $usage = array_slice($repo->usage($runId), $before);
+        if (is_object($context) && method_exists($context, 'addCost')) {
+            foreach ($usage as $u) {
+                $money = isset($u['money_micros']) && is_numeric($u['money_micros']) ? Money::format((int) $u['money_micros'], 6) : '0';
+                $context->addCost($money, ['input_units' => (int) ($u['billed_seconds'] ?? 0), 'output_units' => 0, 'metered' => SpendMeter::present()]);
             }
         }
-        $usage = array_slice($this->p->repo()->usage($runId), $before);
+        $run = $repo->get($runId);
+        if ($run !== null && in_array($run->state, [RunState::QUEUED, RunState::TRANSCRIBING, RunState::PAUSED], true) && $repo->chunkResult($runId, $chunk) === null) {
+            // Locked by another worker, waiting on a retry time, or paused by a cap.
+            GenQueue::retryLater('audio-to-post run ' . $runId . ' chunk ' . $chunk . ' could not run yet');
+        }
 
-        return ['usage' => $usage, 'metered' => SpendMeter::present()];
+        return ['run_id' => $runId, 'chunk' => $chunk, 'calls' => count($usage)];
     }
 
     private function holdAdapter(string $adapterId, string $code, int $failedRun): void
@@ -814,6 +827,8 @@ final class Runner
             $ready = $reason === 'kill_switch' ? !$switchOn : $resumeAt <= $now;
             if ($ready) {
                 $repo->setMeta($id, 'due_at', 0);
+                // Hand missing chunks to gen-queue again on the next tick.
+                $repo->setFlags($id, ['gen_queue' => null]);
                 $repo->move($id, RunState::QUEUED, 'resumed after ' . $reason);
             }
         }
@@ -822,6 +837,16 @@ final class Runner
     public function sweep(): void
     {
         $repo = $this->p->repo();
+        try {
+            $this->sweepFiles($repo);
+        } catch (StateException $e) {
+            // The private directory is not usable; nothing can be deleted from it either.
+            Debug::log('retention sweep skipped: ' . $e->getMessage());
+        }
+    }
+
+    private function sweepFiles(RunRepository $repo): void
+    {
         $this->p->files()->sweep(function (int $runId, string $line) use ($repo): void {
             if ($runId > 0 && $repo->exists($runId)) {
                 $repo->log($runId, $line);

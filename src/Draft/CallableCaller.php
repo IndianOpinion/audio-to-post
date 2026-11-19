@@ -28,7 +28,15 @@ final class CallableCaller implements LlmCaller
 
     public function call(array $request, array $context): array
     {
-        $out = ($this->fn)($request, $context);
+        try {
+            $out = ($this->fn)($request, $context);
+        } catch (ProviderException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            // A site caller that throws must not leave the run stuck in
+            // `drafting` and retried (and paid for) on every tick.
+            throw new ProviderException(ProviderException::BAD_RESPONSE, 'Site caller failed: ' . $e->getMessage(), false, null, null, null, $e);
+        }
         if (is_object($out) && is_a($out, 'WP_Error')) {
             /** @var \WP_Error $out */
             throw new ProviderException(ProviderException::TRANSIENT, 'Site caller: ' . $out->get_error_message(), true);

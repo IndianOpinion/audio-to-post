@@ -18,11 +18,15 @@ use IndianOpinion\AudioToPost\StateException;
  */
 final class SpendGuard
 {
+    public const HOLDS = 'audiopost_inflight';
+    public const LOCK = 'spend';
+
     public function __construct(
         private readonly Settings $settings,
         private readonly UsageLedger $ledger,
         private readonly Clock $clock,
         private readonly RunRepository $repo,
+        private readonly Lock $locks,
     ) {
     }
 
@@ -99,24 +103,58 @@ final class SpendGuard
      * Run every check before one paid call. Returns a spend-meter
      * reservation id when one was given.
      *
+     * The checks and the in-flight hold run under one short site-wide
+     * lock: two runs racing near a cap each see the other's call in
+     * flight, so both may wait but neither overshoots. The hold is
+     * cleared by settle() once the call is recorded, and expires on its
+     * own after the lock lifetime.
+     *
      * @param array{kind: string, seconds: int, tokens_in: int, tokens_out: int, money_micros: ?int, provider: string, model: string} $intent
      *
      * @throws DisabledException
-     * @throws CapException      daily_cap, denied, spend_meter
+     * @throws CapException      daily_cap, denied, spend_meter, spend_busy
      * @throws StateException    cancelled
      */
-    public function authorize(Run $run, array $intent): ?string
+    public function authorize(Run $run, array $intent, int $holdSeconds = Lock::TTL): ?string
     {
         if (KillSwitch::isOn()) {
             throw new DisabledException('kill_switch', 'The kill switch is on.');
         }
+        $token = null;
+        for ($try = 0; $try < 20 && $token === null; $try++) {
+            $token = $this->locks->acquire(self::LOCK, 30);
+            if ($token === null) {
+                usleep(100_000);
+            }
+        }
+        if ($token === null) {
+            throw new CapException('spend_busy', 'Another paid call is being checked; trying again on the next tick.');
+        }
+        try {
+            $reservation = $this->check($run, $intent);
+            $this->hold($run->id, $intent, $holdSeconds);
+
+            return $reservation;
+        } finally {
+            $this->locks->release(self::LOCK, $token);
+        }
+    }
+
+    /**
+     * @param array{kind: string, seconds: int, tokens_in: int, tokens_out: int, money_micros: ?int, provider: string, model: string} $intent
+     *
+     * @throws CapException|StateException
+     */
+    private function check(Run $run, array $intent): ?string
+    {
         $caps = $this->caps();
         $t = $this->ledger->totals();
+        $held = $this->held($run->id);
         $day = $this->clock->localDay();
         $checks = [
-            'minutes' => [$caps['seconds'], $t['seconds'], $intent['seconds']],
-            'tokens' => [$caps['tokens'], $t['tokens_in'] + $t['tokens_out'], $intent['tokens_in'] + $intent['tokens_out']],
-            'money' => [$intent['money_micros'] === null ? null : $caps['money'], $t['money_micros'], (int) $intent['money_micros']],
+            'minutes' => [$caps['seconds'], $t['seconds'] + $held['seconds'], $intent['seconds']],
+            'tokens' => [$caps['tokens'], $t['tokens_in'] + $t['tokens_out'] + $held['tokens'], $intent['tokens_in'] + $intent['tokens_out']],
+            'money' => [$intent['money_micros'] === null ? null : $caps['money'], $t['money_micros'] + $held['money'], (int) $intent['money_micros']],
         ];
         foreach ($checks as $unit => [$cap, $used, $need]) {
             if ($cap !== null && $need > 0 && $used + $need > $cap) {
@@ -133,22 +171,105 @@ final class SpendGuard
         }
         $reservation = null;
         if (SpendMeter::present()) {
-            $res = SpendMeter::preSpend($intent);
-            if (($res['allowed'] ?? null) !== true) {
-                $reason = is_string($res['reason'] ?? null) ? $res['reason'] : 'denied';
-                throw new CapException('spend_meter', 'spend-meter said no: ' . $reason);
+            $res = SpendMeter::preSpend($intent, $run->id);
+            if ($res !== null) {
+                if (($res['allowed'] ?? null) !== true) {
+                    $reason = is_string($res['reason'] ?? null) ? $res['reason'] : 'denied';
+                    throw new CapException('spend_meter', 'spend-meter said no: ' . $reason);
+                }
+                $reservation = is_string($res['reservation_id'] ?? null) && $res['reservation_id'] !== '' ? $res['reservation_id'] : null;
             }
-            $reservation = is_string($res['reservation_id'] ?? null) || is_int($res['reservation_id'] ?? null) ? (string) $res['reservation_id'] : null;
         }
         wp_cache_delete($run->id, 'post_meta');
         if ($this->repo->meta($run->id, 'cancel')) {
-            if ($reservation !== null) {
-                SpendMeter::release($reservation, 'cancelled');
-            }
+            SpendMeter::release($reservation);
             throw new StateException('cancelled', 'The run was cancelled.');
         }
 
         return $reservation;
+    }
+
+    /**
+     * Hold a call's estimate against the caps while it is in flight. One
+     * hold per run: a run sends one call at a time under its own lock.
+     *
+     * @param array{kind: string, seconds: int, tokens_in: int, tokens_out: int, money_micros: ?int, provider: string, model: string} $intent
+     */
+    private function hold(int $runId, array $intent, int $seconds): void
+    {
+        $holds = $this->holds();
+        $holds['r' . $runId] = [
+            's' => max(0, $intent['seconds']),
+            't' => max(0, $intent['tokens_in'] + $intent['tokens_out']),
+            'm' => max(0, (int) $intent['money_micros']),
+            'day' => $this->clock->localDay(),
+            'exp' => $this->clock->now() + max(60, $seconds),
+        ];
+        Options::set(self::HOLDS, $holds);
+    }
+
+    /** The call of a run was recorded (or never made): drop its hold. */
+    public function settle(int $runId): void
+    {
+        if (!isset($this->holds()['r' . $runId])) {
+            return;
+        }
+        // Under the same lock as authorize(), so a new hold written by
+        // another run at this moment is not lost. If the lock stays busy,
+        // the hold simply expires on its own.
+        $token = null;
+        for ($try = 0; $try < 20 && $token === null; $try++) {
+            $token = $this->locks->acquire(self::LOCK, 30);
+            if ($token === null) {
+                usleep(100_000);
+            }
+        }
+        if ($token === null) {
+            return;
+        }
+        try {
+            $holds = $this->holds();
+            unset($holds['r' . $runId]);
+            Options::set(self::HOLDS, $holds);
+        } finally {
+            $this->locks->release(self::LOCK, $token);
+        }
+    }
+
+    /**
+     * Live holds of other runs for today.
+     *
+     * @return array{seconds: int, tokens: int, money: int}
+     */
+    private function held(int $exceptRun): array
+    {
+        $out = ['seconds' => 0, 'tokens' => 0, 'money' => 0];
+        $day = $this->clock->localDay();
+        foreach ($this->holds() as $key => $h) {
+            if ($key === 'r' . $exceptRun || $h['day'] !== $day) {
+                continue;
+            }
+            $out['seconds'] += $h['s'];
+            $out['tokens'] += $h['t'];
+            $out['money'] += $h['m'];
+        }
+
+        return $out;
+    }
+
+    /** @return array<string, array{s: int, t: int, m: int, day: string, exp: int}> */
+    private function holds(): array
+    {
+        $raw = Options::fresh(self::HOLDS, []);
+        $now = $this->clock->now();
+        $out = [];
+        foreach (is_array($raw) ? $raw : [] as $k => $h) {
+            if (is_array($h) && (int) ($h['exp'] ?? 0) > $now) {
+                $out[(string) $k] = ['s' => (int) ($h['s'] ?? 0), 't' => (int) ($h['t'] ?? 0), 'm' => (int) ($h['m'] ?? 0), 'day' => (string) ($h['day'] ?? ''), 'exp' => (int) $h['exp']];
+            }
+        }
+
+        return $out;
     }
 
     private static function parseInt(string $v): ?int

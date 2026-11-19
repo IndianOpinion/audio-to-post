@@ -78,13 +78,27 @@ final class RunService
                 $this->p->urlGuard()->check($url);
             }
             if ($source->kind === Source::ATTACHMENT) {
-                $mime = (string) get_post_mime_type($source->attachmentId());
-                if ($mime === '' || get_post($source->attachmentId()) === null) {
-                    throw new SourceException('invalid_source', 'The attachment does not exist.');
-                }
+                $mime = self::attachmentMime($source->attachmentId());
                 if (str_starts_with($mime, 'video/')) {
                     throw new AudioException('video_not_supported', 'Video files are not supported. Upload the audio only.');
                 }
+                if (!str_starts_with($mime, 'audio/') && !in_array($mime, ['application/ogg', 'application/octet-stream'], true)) {
+                    throw new SourceException('not_audio', 'The attachment is not an audio file.');
+                }
+            }
+        }
+        foreach (['transcript_attachment_id', 'media_attachment_id'] as $k) {
+            $att = (int) ($source->fields[$k] ?? 0);
+            if ($att > 0) {
+                self::attachmentMime($att);
+            }
+        }
+        $tAtt = (int) ($source->fields['transcript_attachment_id'] ?? 0);
+        if ($source->kind === Source::TRANSCRIPT_FILE && $tAtt > 0) {
+            $file = get_attached_file($tAtt);
+            $ext = is_string($file) ? strtolower(pathinfo($file, PATHINFO_EXTENSION)) : '';
+            if (!in_array($ext, ['vtt', 'srt', 'json'], true)) {
+                throw new TranscriptFormatException('transcript_unreadable', 'A transcript file must be WebVTT (.vtt), SRT (.srt) or the plugin JSON (.json).');
             }
         }
         $repo = $this->p->repo();
@@ -100,6 +114,22 @@ final class RunService
         do_action('audiopost_run_created', $run);
 
         return $run;
+    }
+
+    /**
+     * The MIME type of an existing Media Library attachment.
+     *
+     * @throws SourceException invalid_source
+     */
+    private static function attachmentMime(int $id): string
+    {
+        $post = get_post($id);
+        $mime = (string) get_post_mime_type($id);
+        if (!$post instanceof \WP_Post || $post->post_type !== 'attachment' || $mime === '') {
+            throw new SourceException('invalid_source', 'The attachment does not exist.');
+        }
+
+        return $mime;
     }
 
     /**
@@ -550,20 +580,19 @@ final class RunService
             throw new StateException('not_confirmed', 'This run failed before its estimate was confirmed. Start a new run.');
         }
         $est = $this->estimate($id, true);
-        {
-            $before = $repo->meta($id, 'confirmed_remaining');
-            $fresh = $est->fingerprint;
-            $changed = is_string($before) && !hash_equals($before, $fresh);
+        $before = $repo->meta($id, 'confirmed_remaining');
+        $fresh = $est->fingerprint;
+        $changed = is_string($before) && !hash_equals($before, $fresh);
         if (($changed || $fingerprint !== null) && ($fingerprint === null || !hash_equals($fresh, $fingerprint))) {
             $repo->setMeta($id, 'confirmed_remaining', $fresh);
             throw new StateException('estimate_stale', 'The remaining cost changed. Check the new estimate and confirm the retry.');
         }
-            $repo->setMeta($id, 'confirmed_remaining', $fresh);
-        }
+        $repo->setMeta($id, 'confirmed_remaining', $fresh);
         $repo->deleteMeta($id, 'chunk_attempts');
         $repo->deleteMeta($id, 'retry_at');
         $repo->deleteMeta($id, 'error');
         $repo->setMeta($id, 'due_at', 0);
+        $repo->setFlags($id, ['gen_queue' => null]);
         $fileId = (string) $repo->meta($id, 'file', '');
         if ($fileId !== '' && !is_file($this->p->files()->path($fileId))) {
             $repo->setFlags($id, ['refetch' => true]);

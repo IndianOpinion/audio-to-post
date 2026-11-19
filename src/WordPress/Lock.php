@@ -6,8 +6,9 @@ namespace IndianOpinion\AudioToPost\WordPress;
 
 /**
  * A per-run lock stored as a non-autoloaded option. `add_option` is an
- * insert, so only one process gets a fresh lock; an expired lock can be
- * taken over (case 36: 15-minute expiry, renewed after each chunk).
+ * insert, so only one process gets a fresh lock; an expired lock is taken
+ * over with a conditional UPDATE, so only one process wins that too
+ * (case 36: 15-minute expiry, renewed after each chunk).
  */
 final class Lock
 {
@@ -29,9 +30,34 @@ final class Lock
         if (is_array($current) && (int) ($current['expires'] ?? 0) > $this->clock->now()) {
             return null;
         }
-        delete_option($key);
+        if ($current === null) {
+            // Released between our insert and our read: one more insert.
+            return add_option($key, $value, '', false) ? $token : null;
+        }
 
-        return add_option($key, $value, '', false) ? $token : null;
+        return self::swap($key, $current, $value) ? $token : null;
+    }
+
+    /**
+     * Take over an expired lock with one conditional UPDATE, so of two
+     * processes that both saw it expire only one wins. A plain delete and
+     * add would let the second one delete the first one's fresh lock.
+     *
+     * @param array<string, mixed> $value
+     */
+    private static function swap(string $key, mixed $current, array $value): bool
+    {
+        global $wpdb;
+        $won = (int) $wpdb->query($wpdb->prepare(
+            "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+            maybe_serialize($value),
+            $key,
+            maybe_serialize($current)
+        )) === 1;
+        wp_cache_delete($key, 'options');
+        wp_cache_delete('alloptions', 'options');
+
+        return $won;
     }
 
     public function renew(string $name, string $token, int $ttl = self::TTL): bool

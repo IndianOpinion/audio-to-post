@@ -171,14 +171,62 @@ WordPress layer (`src/WordPress/`):
   per-block prompt overhead plus the carried notes, plus 10 per cent.
   Final pass: all notes outputs, a quote allowance of 10 per cent of the
   transcript tokens (at most 8000) and the prompt, plus 10 per cent.
-- **spend-meter and gen-queue contracts** are taken from the PRD text
-  only. `spend_meter_pre_spend` gets null and the intent and must return
-  an array with `allowed` exactly true; `spend_meter_record` and
-  `spend_meter_release` are actions. gen-queue types are registered
-  through a `register(type, handler)` method on the action argument when
-  present; jobs go through the `gen_queue_enqueue_job` filter. If either
-  project's released interface differs, these two small classes
-  (`SpendMeter`, `GenQueue`) are the only places to change.
+- **spend-meter contract (version 1, checked against spend-meter
+  0.1.0).** Present when `SPEND_METER_API` is defined and equals 1.
+  `spend_meter_pre_spend` gets null and an intent with `purpose`
+  (`audio-to-post.transcribe` or `audio-to-post.draft`), `caller`,
+  `provider`, `model` (the adapter id when an adapter has no model name),
+  `est_input_tokens`, `max_output_tokens`, `est_units` (minutes, audio
+  only) and `meta.run_id`. A null result means no meter is listening and
+  the plugin's own guards decide; a call goes ahead only when `allowed` is
+  exactly true; any other non-array result is a deny. Every attempt that
+  reached the provider is recorded once with one call array
+  (`spend_meter_record`, status `ok`, `error_billed` or
+  `error_unbilled`, with the reservation id). `spend_meter_release` gets
+  the reservation id alone and is used only when no call was made
+  (cancel, missing copy).
+- **gen-queue contract (checked against gen-queue 0.1.0).** On
+  `gen_queue_register_types` the plugin calls
+  `gen_queue_register_type('audio-to-post.chunk', handler, args)`. Jobs
+  go through `apply_filters('gen_queue_enqueue_job', null, $type,
+  $payload, $args)` with the payload `{run_id, chunk}`, an idempotency key
+  per chunk, `on_conflict` `requeue` and a `cost_estimate` when prices are
+  set. Anything but a job id (null, `WP_Error`) falls back to the
+  plugin's own runner. The handler takes gen-queue's `Job` and
+  `JobContext`, runs the chunk under the run lock with every check,
+  reports cost through `addCost()` (marked `metered` when spend-meter
+  recorded it) and throws gen-queue's `RetryableException` when the chunk
+  could not run yet. A run resumed from a pause or retried hands its
+  missing chunks to gen-queue again. Drafts always run in the plugin's
+  own runner.
+- **Cap races.** Every paid call is checked under one short site-wide
+  lock, and its estimate is held against the caps (option
+  `audiopost_inflight`) until its usage row is written or the hold
+  expires (the lock lifetime; the async timeout for submitted jobs). Two
+  runs racing near a cap may both wait, but they cannot overshoot it. A
+  usage row the table refuses is kept in an option, counted in the totals
+  and written later.
+- **Locks.** An expired run lock is taken over with one conditional
+  `UPDATE` on the option row, so only one process wins it.
+- **Remote fetches.** Every hop is checked by the guard after DNS
+  resolution and then pinned to the checked addresses (cURL `RESOLVE`),
+  so a second DNS answer cannot point the request somewhere else. A
+  resumed download is appended only when `Content-Range` starts at the
+  requested byte.
+- **Hostile audio headers.** Header fields are bounds-checked before they
+  are read; a non-syncsafe ID3 size is ignored; the MP3 frame search has
+  a time budget even for the first frame; a WAV `fmt ` chunk with
+  impossible values fails, and one whose byte rate or block size
+  disagrees with itself is neither split nor trusted for its length. An
+  MP3 whose frames cannot all be read in time is not split.
+- **Private directory fails closed.** If the directory, its `index.php`
+  or its deny-all `.htaccess` (also in `transcripts/`) cannot be written,
+  nothing is stored there and the run fails with `storage_unwritable`.
+- **Prompt injection.** Transcript text is one line per segment in the
+  prompt, so it cannot forge segment ids, and every prompt says the
+  transcript is material, not instructions. Replies are schema-checked,
+  quotes are checked against their segments, all text is escaped, and the
+  result is always a draft.
 - **Draft titles and excerpts** are model text with tags stripped; all
   body text is escaped and square brackets are encoded so no shortcode
   runs.
@@ -190,15 +238,17 @@ WordPress layer (`src/WordPress/`):
 - **Debug log** lines go through `error_log` only with `WP_DEBUG_LOG`, and
   every stored or logged message passes through a redactor that strips
   every configured key.
-- **Video in an attachment.** An attachment whose MIME type is `video/*`
-  is refused at creation (`video_not_supported`).
+- **Attachment types.** An attachment source must be a Media Library
+  attachment with an `audio/*` type (`video/*` is `video_not_supported`,
+  anything else `not_audio`); a transcript file must be `.vtt`, `.srt` or
+  `.json`. The upload form checks the type before the file is saved.
 - **mbstring** is required; **intl** is suggested (without it NFC
   normalisation is skipped).
 
 ## Not in 0.1.0
 
-- A deletion that fails is counted and retried at the next sweep and shown
-  on the status screen; the test suite cannot make `unlink` fail as root,
-  so that path is covered by reading, not by a test.
+- A deletion that fails is counted, logged and retried at the next sweep
+  and shown on the status screen. The delete function can be injected, and
+  the test suite covers the failure and the retry.
 - Usage for a failed model call is recorded only when the caller returns
   usage; llm-json-php failures carry none through its exception.

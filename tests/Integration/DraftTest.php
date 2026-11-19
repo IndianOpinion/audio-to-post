@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IndianOpinion\AudioToPost\Tests\Integration;
 
 use IndianOpinion\AudioToPost\Draft\LlmJsonCaller;
+use IndianOpinion\AudioToPost\ProviderException;
 use IndianOpinion\AudioToPost\Run;
 use IndianOpinion\AudioToPost\RunState;
 use IndianOpinion\AudioToPost\SourceException;
@@ -163,6 +164,23 @@ final class DraftTest extends WpTestCase
         $run = $this->transcribed('article');
         self::assertSame(RunState::DRAFT_READY, $run->state);
         self::assertSame(2, $n);
+    }
+
+    /** T85: a site caller that throws fails the draft step cleanly once; the run is not left drafting. */
+    public function testThrowingSiteCallerDoesNotLoop(): void
+    {
+        $n = 0;
+        $caller = static function () use (&$n): array {
+            $n++;
+            throw new \RuntimeException('boom');
+        };
+        add_filter('audiopost_llm_caller', static fn () => $caller, 10, 2);
+        $run = $this->transcribed('article');
+        self::assertSame(RunState::TRANSCRIPT_READY, $run->state);
+        self::assertSame(1, $n, 'not retried on every tick');
+        $this->drain();
+        self::assertSame(1, $n);
+        self::assertSame(ProviderException::BAD_RESPONSE, $run->errorCode);
     }
 
     /** T88: without llm-json-php the plugin loads; model modes are unavailable; transcript mode works. */

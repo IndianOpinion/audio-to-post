@@ -84,8 +84,8 @@ final class DraftService
     }
 
     /**
-     * Work through the run's draft queue. Returns `kill_switch` or
-     * `daily_cap` when stopped by one of them.
+     * Work through the run's draft queue. Returns `kill_switch`,
+     * `daily_cap`, `spend_meter` or `busy` when stopped by one of them.
      */
     public function process(int $id, float $deadline): ?string
     {
@@ -131,6 +131,9 @@ final class DraftService
 
                 return 'kill_switch';
             } catch (CapException $e) {
+                if ($e->errorCode() === 'spend_busy') {
+                    return 'busy';
+                }
                 if ($e->errorCode() === 'daily_cap') {
                     $this->p->runner()->pause($id, 'daily_cap', $this->p->clock()->nextLocalMidnight());
 
@@ -307,9 +310,9 @@ final class DraftService
             try {
                 $out = $caller->call($request, $context);
             } catch (ProviderException $e) {
-                if ($reservation !== null) {
-                    SpendMeter::release($reservation, $e->errorCode());
-                }
+                // The call was attempted: record it for spend-meter, drop the hold.
+                SpendMeter::record($reservation, ['kind' => 'draft', 'provider' => $caller->id(), 'model' => $model, 'status' => 'error_unbilled', 'http_status' => $e->httpStatus(), 'attempt' => $attempt, 'error_code' => $e->errorCode(), 'run_id' => $run->id]);
+                $this->p->guard()->settle($run->id);
                 $repo->log($run->id, sprintf('%s %s call failed: %s', $mode, $pass, Settings::redact($e->getMessage())));
                 if ($e->retryable() && $attempt < $max && $caller instanceof CallableCaller) {
                     continue;
@@ -318,9 +321,7 @@ final class DraftService
             }
             $money = $this->tokenMoney($model, $out['tokens_in'], $out['tokens_out']);
             $this->p->runner()->recordUsage($run->id, 'draft', $caller->id() . ($model !== '' ? ':' . $model : ''), $mode . '.' . $pass, 0, $out['tokens_in'], $out['tokens_out'], $money, 200, $attempt);
-            if (SpendMeter::present()) {
-                SpendMeter::record($reservation, ['purpose' => 'audio-to-post.draft', 'provider' => $caller->id(), 'model' => $model, 'tokens_in' => $out['tokens_in'], 'tokens_out' => $out['tokens_out']]);
-            }
+            SpendMeter::record($reservation, ['kind' => 'draft', 'provider' => $caller->id(), 'model' => $model, 'status' => 'ok', 'http_status' => 200, 'input_tokens' => $out['tokens_in'], 'output_tokens' => $out['tokens_out'], 'attempt' => $attempt, 'run_id' => $run->id]);
             $problems = DraftSchema::validate($out['data'], $schema);
             if ($problems === []) {
                 return $out['data'];

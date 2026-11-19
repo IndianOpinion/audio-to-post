@@ -77,9 +77,9 @@ final class Hooks
         Plugin::instance()->runner()->daily();
     }
 
-    public static function genQueueTypes(mixed $registry = null): void
+    public static function genQueueTypes(): void
     {
-        GenQueue::registerTypes($registry, [Plugin::instance()->runner(), 'handleJob']);
+        GenQueue::registerTypes([Plugin::instance()->runner(), 'handleJob']);
     }
 
     /** A draft deleted by hand: drop it from its run (case 70). */

@@ -44,6 +44,29 @@ final class LifecycleTest extends WpTestCase
         self::assertSame(400, $err->get_error_data()['status']);
     }
 
+    /** T1 and T5: only audio attachments and .vtt, .srt or .json transcripts are accepted. */
+    public function testAttachmentTypesAreChecked(): void
+    {
+        $codes = [];
+        $try = function (array $source) use (&$codes): void {
+            try {
+                $this->p->runs()->create($source, ['rights_confirmed' => true, 'mode' => 'none'], 1);
+                $codes[] = 'none';
+            } catch (\IndianOpinion\AudioToPost\AudioToPostException $e) {
+                $codes[] = $e->errorCode();
+            }
+        };
+        $png = AudioFixtures::bytes("\x89PNG\r\n", 100, 'png');
+        $try(['kind' => 'attachment', 'attachment_id' => $this->attachment($png, 'image/png')]);
+        $post = wp_insert_post(['post_type' => 'post', 'post_title' => 'not media', 'post_mime_type' => 'audio/mpeg']);
+        $try(['kind' => 'attachment', 'attachment_id' => (int) $post]);
+        $txt = AudioFixtures::dir() . '/t.txt';
+        file_put_contents($txt, 'hello');
+        $try(['kind' => 'transcript_file', 'transcript_attachment_id' => $this->attachment($txt, 'text/plain')]);
+        $try(['kind' => 'transcript_file', 'transcript_attachment_id' => (int) $post]);
+        self::assertSame(['not_audio', 'invalid_source', 'transcript_unreadable', 'invalid_source'], $codes);
+    }
+
     /** T5 and T39: an SRT upload is free and skips confirmation when no draft is asked. */
     public function testTranscriptFileIsFree(): void
     {

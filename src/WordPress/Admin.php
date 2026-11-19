@@ -571,6 +571,16 @@ final class Admin
                 require_once ABSPATH . 'wp-admin/includes/media.php';
                 require_once ABSPATH . 'wp-admin/includes/image.php';
                 $field = $kind === 'upload' ? 'audio' : 'transcript_file';
+                // Check the type before anything lands in the Media Library.
+                $name = isset($_FILES[$field]['name']) && is_string($_FILES[$field]['name']) ? sanitize_file_name(wp_unslash($_FILES[$field]['name'])) : '';
+                $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+                $type = wp_check_filetype($name);
+                $ok = $kind === 'upload'
+                    ? is_string($type['type']) && (str_starts_with($type['type'], 'audio/') || $type['type'] === 'application/ogg')
+                    : in_array($ext, ['vtt', 'srt', 'json'], true);
+                if (!$ok) {
+                    self::back(0, $kind === 'upload' ? 'Upload an audio file (MP3, WAV, M4A, Ogg, FLAC or WebM audio).' : 'Upload a WebVTT, SRT or JSON transcript.', 'error');
+                }
                 $att = media_handle_upload($field, 0);
                 if (is_wp_error($att)) {
                     self::back(0, $att->get_error_message(), 'error');

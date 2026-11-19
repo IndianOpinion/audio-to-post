@@ -13,6 +13,7 @@ final class UsageLedger
 {
     public const DB_VERSION = '1';
     public const KEEP_DAYS = 400;
+    public const BUFFER = 'audiopost_usage_buffer';
 
     public function __construct(private readonly Clock $clock)
     {
@@ -80,7 +81,14 @@ final class UsageLedger
         global $wpdb;
         $now = $this->clock->now();
         $row = $r + ['local_day' => $this->clock->localDay($now), 'created_utc' => gmdate('Y-m-d H:i:s', $now)];
-        $wpdb->insert(self::table(), $row);
+        if ($wpdb->insert(self::table(), $row) === false) {
+            // Never lose a paid call: keep it in an option, count it in the
+            // totals and insert it on a later write (fail closed on caps).
+            $buffer = self::buffer();
+            $buffer[] = $row;
+            Options::set(self::BUFFER, array_slice($buffer, -1000));
+            Debug::log('usage row could not be written to the ledger table; kept in the buffer');
+        }
         $record = $row;
         $record['money'] = $r['money_micros'] === null ? null : \IndianOpinion\AudioToPost\Estimate\Money::format($r['money_micros'], 6);
         do_action('audiopost_usage_recorded', $record);
@@ -97,19 +105,68 @@ final class UsageLedger
     {
         global $wpdb;
         $day ??= $this->clock->localDay();
+        $pending = $this->flushBuffer();
         $row = $wpdb->get_row($wpdb->prepare(
             'SELECT SUM(billed_seconds) AS seconds, SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out, SUM(money_micros) AS money_micros, COUNT(money_micros) AS money_rows FROM ' . self::table() . ' WHERE local_day = %s',
             $day
         ), ARRAY_A);
         $row = is_array($row) ? $row : [];
-
-        return [
+        $out = [
             'seconds' => (int) ($row['seconds'] ?? 0),
             'tokens_in' => (int) ($row['tokens_in'] ?? 0),
             'tokens_out' => (int) ($row['tokens_out'] ?? 0),
             'money_micros' => (int) ($row['money_micros'] ?? 0),
             'has_money' => (int) ($row['money_rows'] ?? 0) > 0,
         ];
+        foreach ($pending as $p) {
+            if (($p['local_day'] ?? '') !== $day) {
+                continue;
+            }
+            $out['seconds'] += (int) ($p['billed_seconds'] ?? 0);
+            $out['tokens_in'] += (int) ($p['tokens_in'] ?? 0);
+            $out['tokens_out'] += (int) ($p['tokens_out'] ?? 0);
+            if (isset($p['money_micros']) && is_numeric($p['money_micros'])) {
+                $out['money_micros'] += (int) $p['money_micros'];
+                $out['has_money'] = true;
+            }
+        }
+
+        return $out;
+    }
+
+    /** @return list<array<string, mixed>> */
+    private static function buffer(): array
+    {
+        $b = Options::fresh(self::BUFFER, []);
+
+        return is_array($b) ? array_values(array_filter($b, 'is_array')) : [];
+    }
+
+    /**
+     * Retry buffered rows. Returns the rows still not written.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function flushBuffer(): array
+    {
+        global $wpdb;
+        $buffer = self::buffer();
+        if ($buffer === []) {
+            return [];
+        }
+        $left = [];
+        foreach ($buffer as $row) {
+            if ($wpdb->insert(self::table(), $row) === false) {
+                $left[] = $row;
+            }
+        }
+        if ($left === []) {
+            delete_option(self::BUFFER);
+        } else {
+            Options::set(self::BUFFER, $left);
+        }
+
+        return $left;
     }
 
     /** Delete rows older than KEEP_DAYS local days. */

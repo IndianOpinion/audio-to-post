@@ -6,7 +6,7 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-11-18
+## [0.1.0] - 2026-11-19
 
 ### Added
 
@@ -32,3 +32,8 @@ project uses [Semantic Versioning](https://semver.org/).
   orphan handling, run retention, privacy exporter and eraser.
 - REST API, WP-CLI commands, admin screens, uninstall routine and a
   must-use loader.
+- spend-meter (contract 1) and gen-queue (0.1.0) integration through
+  their documented hooks only.
+- In-flight holds against the daily caps, a buffer for usage rows the
+  table refuses, DNS pinning of every fetch hop, and a private directory
+  that fails closed.
