@@ -232,6 +232,10 @@ Tune words per minute and the tokens-per-word ratio for your languages.
 `audiopost_llm_caller`. The plugin still checks the schema, the quotes,
 the caps and the kill switch.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Indian Opinion.
