@@ -1,0 +1,77 @@
+{
+    "name": "indianopinion/audio-to-post",
+    "description": "WordPress plugin: turns an uploaded audio file or a podcast episode into a transcript and a draft post, keeping speaker turns and timestamps, with chunking for long recordings and a cost estimate the editor confirms first.",
+    "type": "wordpress-plugin",
+    "license": "MIT",
+    "keywords": [
+        "wordpress",
+        "transcription",
+        "speech-to-text",
+        "podcast",
+        "audio",
+        "draft"
+    ],
+    "homepage": "https://github.com/IndianOpinion/audio-to-post",
+    "support": {
+        "issues": "https://github.com/IndianOpinion/audio-to-post/issues",
+        "source": "https://github.com/IndianOpinion/audio-to-post",
+        "email": "hello@indianopinion.org"
+    },
+    "authors": [
+        {
+            "name": "Indian Opinion",
+            "email": "hello@indianopinion.org",
+            "homepage": "https://indianopinion.org"
+        }
+    ],
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/IndianOpinion/llm-json-php",
+            "no-api": true
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "ext-json": "*",
+        "ext-mbstring": "*",
+        "indianopinion/llm-json-php": "^0.1"
+    },
+    "require-dev": {
+        "php-stubs/wordpress-stubs": "^6.4",
+        "php-stubs/wp-cli-stubs": "^2.10",
+        "phpstan/phpstan": "^2.1",
+        "phpunit/phpunit": "^10.5",
+        "squizlabs/php_codesniffer": "^3.10"
+    },
+    "suggest": {
+        "ext-intl": "Unicode NFC normalisation for quote and seam checks."
+    },
+    "autoload": {
+        "psr-4": {
+            "IndianOpinion\\AudioToPost\\": "src/"
+        },
+        "files": [
+            "src/functions.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "IndianOpinion\\AudioToPost\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse --no-progress --memory-limit=1G",
+        "lint": "phpcs",
+        "check": [
+            "@lint",
+            "@analyse",
+            "@test"
+        ]
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}

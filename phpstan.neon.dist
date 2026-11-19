@@ -1,0 +1,20 @@
+parameters:
+    level: 8
+    phpVersion: 80100
+    paths:
+        - src
+        - audio-to-post.php
+        - bootstrap.php
+        - uninstall.php
+        - mu-loader
+    scanFiles:
+        - vendor/php-stubs/wordpress-stubs/wordpress-stubs.php
+        - vendor/php-stubs/wp-cli-stubs/wp-cli-stubs.php
+    bootstrapFiles:
+        - tests/phpstan-constants.php
+    treatPhpDocTypesAsCertain: false
+    rememberPossiblyImpureFunctionValues: false
+    ignoreErrors:
+        -
+            # WordPress admin include files exist at runtime, not here.
+            identifier: requireOnce.fileNotFound
