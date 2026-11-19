@@ -80,7 +80,8 @@ final class Mp3Reader
             return 0;
         }
         $s = unpack('C4', substr($head, 6, 4));
-        if ($s === false) {
+        if ($s === false || (($s[1] | $s[2] | $s[3] | $s[4]) & 0x80) !== 0) {
+            // Not a syncsafe size: a broken or hostile tag. Scan from the start.
             return 0;
         }
         $size = ($s[1] << 21) | ($s[2] << 14) | ($s[3] << 7) | $s[4];
@@ -125,7 +126,9 @@ final class Mp3Reader
                 $dataEnd = $size - 128;
             }
         }
-        $first = self::findFirstFrame($h, $start, $dataEnd);
+        // Finding the first frame gets at least one second of its own, so a
+        // file of junk bytes cannot hold the worker for minutes either way.
+        $first = self::findFirstFrame($h, $start, $dataEnd, null, microtime(true) + max(1.0, $cpuSeconds));
         if ($first === null) {
             fclose($h);
             throw new AudioException('unreadable_audio', 'No MPEG audio frame was found in the file.');
@@ -162,8 +165,11 @@ final class Mp3Reader
             $f = self::parseHeader(substr($buf, $pos - $bufStart, 4));
             if ($f === null || $f['sample_rate'] !== $sampleRate) {
                 // Lost sync: look for the next valid frame (junk or a tag inside the data).
-                $next = self::findFirstFrame($h, $pos + 1, $dataEnd, $sampleRate);
+                $next = self::findFirstFrame($h, $pos + 1, $dataEnd, $sampleRate, $deadline);
                 if ($next === null) {
+                    if (microtime(true) > $deadline) {
+                        $complete = false;
+                    }
                     break;
                 }
                 $pos = $next[0];
@@ -221,10 +227,14 @@ final class Mp3Reader
      *
      * @return array{0: int, 1: array{version: int, bitrate: int, sample_rate: int, padding: int, channels: int, length: int, samples: int}}|null
      */
-    private static function findFirstFrame($h, int $from, int $end, ?int $sampleRate = null): ?array
+    private static function findFirstFrame($h, int $from, int $end, ?int $sampleRate = null, ?float $deadline = null): ?array
     {
         $pos = $from;
         while ($pos + 4 <= $end) {
+            if ($deadline !== null && microtime(true) > $deadline) {
+                // A file of junk bytes must not hold the worker past its budget.
+                return null;
+            }
             fseek($h, $pos);
             $buf = (string) fread($h, self::BLOCK);
             if ($buf === '') {
@@ -270,21 +280,28 @@ final class Mp3Reader
         $side = $hdr['version'] === 3 ? ($hdr['channels'] === 1 ? 17 : 32) : ($hdr['channels'] === 1 ? 9 : 17);
         $tag = substr($frame, 4 + $side, 4);
         if ($tag === 'Xing' || $tag === 'Info') {
-            $flags = unpack('N', substr($frame, 8 + $side, 4));
-            if ($flags !== false && ($flags[1] & 1) === 1) {
-                $n = unpack('N', substr($frame, 12 + $side, 4));
-
-                return $n === false ? 0 : (int) $n[1];
+            $flags = self::u32($frame, 8 + $side);
+            if ($flags !== null && ($flags & 1) === 1) {
+                return self::u32($frame, 12 + $side) ?? 0;
             }
 
             return 0;
         }
         if (substr($frame, 36, 4) === 'VBRI') {
-            $n = unpack('N', substr($frame, 36 + 14, 4));
-
-            return $n === false ? 0 : (int) $n[1];
+            return self::u32($frame, 36 + 14) ?? 0;
         }
 
         return null;
+    }
+
+    /** Big-endian 32-bit integer at $at, or null when the bytes are not there. */
+    private static function u32(string $bytes, int $at): ?int
+    {
+        if (strlen($bytes) < $at + 4) {
+            return null;
+        }
+        $v = unpack('N', substr($bytes, $at, 4));
+
+        return $v === false ? null : (int) $v[1];
     }
 }

@@ -29,6 +29,11 @@ final class Mp3Chunker extends AbstractChunker
         $points = array_values(array_unique($points));
         sort($points);
         $scan = Mp3Reader::scan($path, $points, 60.0);
+        if (!$scan['complete']) {
+            // Boundaries past the point where the scan stopped would be
+            // empty or wrong chunks that are still paid for.
+            throw new AudioException('unreadable_audio', 'The MP3 frames could not all be read in time, so the file cannot be split safely.');
+        }
         $map = [];
         foreach ($points as $i => $ms) {
             $map[$ms] = $scan['boundaries'][$i];

@@ -197,4 +197,77 @@ final class AudioTest extends TestCase
         self::assertNull($info->durationMs);
         self::assertFalse($info->durationKnown());
     }
+
+    /** Hostile MP3: a tiny frame whose Xing tag is cut short reads without a warning. */
+    public function testTruncatedXingTagIsSafe(): void
+    {
+        // MPEG-2 Layer III, 8 kbit/s, 24 kHz, mono: 24-byte frames.
+        $header = "\xFF\xF3\x14\xC0";
+        $xing = $header . str_repeat("\0", 9) . 'Xing' . "\0\0\0\x01" . "\0\0\0";
+        self::assertSame(24, strlen($xing));
+        $plain = $header . str_repeat("\0", 20);
+        $path = AudioFixtures::bytes($xing . str_repeat($plain, 2000), 24 + 24 * 2000, 'mp3');
+        $scan = Mp3Reader::scan($path);
+        self::assertSame(0, $scan['info_frames'], 'the cut-short count reads as unknown, not as a warning');
+        self::assertSame(2000, $scan['frames']);
+    }
+
+    /** Hostile MP3: an ID3 size that is not syncsafe or runs past the file does not hide the audio. */
+    public function testHostileId3Size(): void
+    {
+        self::assertSame(0, Mp3Reader::id3v2Size("ID3\x04\x00\x00\xFF\xFF\xFF\xFF"));
+        $f = AudioFixtures::mp3(3.0);
+        $bytes = (string) file_get_contents($f['path']);
+        $path = AudioFixtures::bytes("ID3\x04\x00\x00\x7F\x7F\x7F\x7F" . $bytes, 10 + strlen($bytes), 'mp3');
+        $this->expectException(AudioException::class);
+        Mp3Reader::scan($path);
+    }
+
+    /** Hostile MP3: a large file of sync-like junk is given up within the CPU budget. */
+    public function testJunkIsBoundedByTheBudget(): void
+    {
+        $path = AudioFixtures::bytes(str_repeat("\xFF", 8 * 1048576), 8 * 1048576, 'mp3');
+        $t = microtime(true);
+        try {
+            Mp3Reader::scan($path, [], 0.0);
+            self::fail('expected unreadable_audio');
+        } catch (AudioException $e) {
+            self::assertSame('unreadable_audio', $e->errorCode());
+        }
+        self::assertLessThan(5.0, microtime(true) - $t);
+    }
+
+    /** Hostile WAV: impossible format fields fail; inconsistent ones are not split; sizes are clipped. */
+    public function testHostileWavHeaders(): void
+    {
+        $fmt = static fn (int $format, int $ch, int $rate, int $byteRate, int $align, int $bits): string => 'fmt ' . pack('VvvVVvv', 16, $format, $ch, $rate, $byteRate, $align, $bits);
+        $data = str_repeat("\x01\x00", 8000);
+        $wav = static fn (string $f, int $declared): string => AudioFixtures::bytes('RIFF' . pack('V', 4 + strlen($f) + 8 + strlen($data)) . 'WAVE' . $f . 'data' . pack('V', $declared) . $data, 12 + strlen($f) + 8 + strlen($data), 'wav');
+
+        try {
+            WavReader::read($wav($fmt(1, 0, 8000, 0, 0, 16), strlen($data)));
+            self::fail('zero channels must fail');
+        } catch (AudioException $e) {
+            self::assertSame('unreadable_audio', $e->errorCode());
+        }
+
+        // A byte rate that lies (claims 100x the real rate) is not trusted.
+        $liar = WavReader::read($wav($fmt(1, 1, 8000, 1_600_000, 2, 16), strlen($data)));
+        self::assertFalse($liar['pcm']);
+        self::assertSame(0, $liar['byte_rate']);
+        $info = (new Prober())->probe($wav($fmt(1, 1, 8000, 1_600_000, 2, 16), strlen($data)));
+        self::assertNull($info->durationMs, 'unknown duration: the estimate uses the size upper bound');
+        self::assertFalse((new WavChunker(AudioFixtures::dir()))->supports($info));
+
+        // A data size past the end of the file is clipped to what is there.
+        $long = WavReader::read($wav($fmt(1, 1, 8000, 16000, 2, 16), 0x7FFFFFF0));
+        self::assertSame(strlen($data), $long['data_size']);
+        self::assertTrue($long['pcm']);
+
+        // Extensible with a float sub-format is not PCM.
+        $ext = 'fmt ' . pack('VvvVVvv', 40, 0xFFFE, 1, 8000, 32000, 4, 32) . pack('vvV', 22, 32, 4) . pack('v', 3) . str_repeat("\0", 14);
+        $float = WavReader::read($wav($ext, strlen($data)));
+        self::assertFalse($float['pcm']);
+        self::assertSame(32000, $float['byte_rate']);
+    }
 }

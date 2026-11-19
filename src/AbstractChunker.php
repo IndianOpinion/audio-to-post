@@ -43,7 +43,10 @@ abstract class AbstractChunker implements Chunker
             if ($block === false || $block === '') {
                 break;
             }
-            fwrite($out, $block);
+            if (fwrite($out, $block) !== strlen($block)) {
+                fclose($in);
+                throw new AudioException('storage_unwritable', 'Cannot write a chunk file (disk full?).');
+            }
             $left -= strlen($block);
         }
         fclose($in);

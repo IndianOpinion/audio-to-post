@@ -84,6 +84,8 @@ final class Prober
             } else {
                 $durationMs = intdiv($size * 8 * 1000, max(1, $scan['bitrate']));
             }
+            // A header can lie low; never estimate less than the frames already counted.
+            $durationMs = max($durationMs, $scan['duration_ms']);
         }
 
         return new AudioInfo(
@@ -104,7 +106,7 @@ final class Prober
         try {
             $w = WavReader::read($path);
         } catch (AudioException $e) {
-            return new AudioInfo(FormatDetector::WAV, $size, null, false, 'pcm');
+            return new AudioInfo(FormatDetector::WAV, $size, null, false, 'wav-unreadable');
         }
         $ms = $w['byte_rate'] > 0 ? intdiv($w['data_size'] * 1000, $w['byte_rate']) : null;
 
