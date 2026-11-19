@@ -291,7 +291,10 @@ final class RunRepository
         $json = (string) json_encode($t->toArray(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         if (strlen($json) > self::INLINE_LIMIT) {
             $file = PrivateStorage::newId() . '.json';
-            file_put_contents($this->files->transcriptDir() . '/' . $file, $json);
+            if (file_put_contents($this->files->transcriptDir() . '/' . $file, $json) !== strlen($json)) {
+                // Keep the old copy; never point the run at a file that is not there.
+                throw new StateException('storage_unwritable', 'The transcript could not be written to private storage.');
+            }
             $this->setMeta($id, $key, ['file' => $file]);
         } else {
             $this->setMeta($id, $key, $t->toArray());

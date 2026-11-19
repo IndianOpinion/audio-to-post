@@ -91,6 +91,9 @@ final class FakeWpdb
     public array $usage = [];
     /** @var list<string> */
     public array $queries = [];
+    /** @var list<mixed> */
+    public array $lastArgs = [];
+    public bool $failInserts = false;
 
     public function get_charset_collate(): string
     {
@@ -98,8 +101,11 @@ final class FakeWpdb
     }
 
     /** @param array<string, mixed> $data */
-    public function insert(string $table, array $data): int
+    public function insert(string $table, array $data): int|false
     {
+        if ($this->failInserts) {
+            return false;
+        }
         $this->usage[] = $data;
 
         return 1;
@@ -107,6 +113,7 @@ final class FakeWpdb
 
     public function prepare(string $sql, mixed ...$args): string
     {
+        $this->lastArgs = $args;
         foreach ($args as $a) {
             $sql = (string) preg_replace('/%s|%d/', "'" . addslashes((string) $a) . "'", $sql, 1);
         }
@@ -140,6 +147,15 @@ final class FakeWpdb
     public function query(string $sql): int
     {
         $this->queries[] = $sql;
+        if (str_starts_with($sql, 'UPDATE wp_options SET option_value')) {
+            [$new, $name, $old] = array_map('strval', $this->lastArgs);
+            if (!array_key_exists($name, WPStub::$options) || maybe_serialize(WPStub::$options[$name]) !== $old) {
+                return 0;
+            }
+            WPStub::$options[$name] = unserialize($new);
+
+            return 1;
+        }
         if (preg_match("/DELETE FROM \S+usage WHERE local_day < '([0-9-]+)'/", $sql, $m) === 1) {
             $before = count($this->usage);
             $this->usage = array_values(array_filter($this->usage, static fn (array $u): bool => (string) $u['local_day'] >= $m[1]));
@@ -347,6 +363,18 @@ function add_action(string $hook, callable $cb, int $priority = 10, int $args = 
 {
     return add_filter($hook, $cb, $priority, $args);
 }
+function remove_action(string $hook, callable $cb, int $priority = 10): bool
+{
+    foreach (WPStub::$filters[$hook][$priority] ?? [] as $i => $f) {
+        if ($f === $cb) {
+            unset(WPStub::$filters[$hook][$priority][$i]);
+
+            return true;
+        }
+    }
+
+    return false;
+}
 function remove_all_filters(string $hook): void
 {
     unset(WPStub::$filters[$hook]);
@@ -404,6 +432,10 @@ function delete_option(string $name): bool
     unset(WPStub::$options[$name]);
 
     return true;
+}
+function maybe_serialize(mixed $data): mixed
+{
+    return is_array($data) || is_object($data) ? serialize($data) : $data;
 }
 function wp_cache_delete(int|string $key, string $group = ''): bool
 {
@@ -600,7 +632,8 @@ function wp_upload_dir(?string $time = null, bool $create = true): array
 }
 function wp_mkdir_p(string $dir): bool
 {
-    return is_dir($dir) || mkdir($dir, 0777, true);
+    // Core silences mkdir() the same way and reports failure as false.
+    return is_dir($dir) || @mkdir($dir, 0777, true);
 }
 function wp_read_audio_metadata(string $file): array|false
 {

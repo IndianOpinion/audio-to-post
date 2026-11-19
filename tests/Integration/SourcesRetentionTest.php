@@ -152,6 +152,61 @@ final class SourcesRetentionTest extends WpTestCase
         self::assertNotEmpty(array_filter($this->logLines($other->id), static fn (string $l): bool => str_starts_with($l, 'deleted audio file')));
     }
 
+    /** T85: a deletion that fails is logged, kept in the registry with a failure count, and retried until it works. */
+    public function testFailedDeletionIsRetried(): void
+    {
+        $fail = 2;
+        $attempts = [];
+        $this->p->set('files', new PrivateStorage($this->p->clock(), null, static function (string $path) use (&$fail, &$attempts): bool {
+            $attempts[] = $path;
+            if ($fail > 0) {
+                $fail--;
+
+                return false;
+            }
+
+            return !is_file($path) || unlink($path);
+        }));
+        $this->settings(['keep_recording_hours' => 1]);
+        $run = $this->confirmedRun(AudioFixtures::mp3(5.0)['path']);
+        $this->drain();
+        $fileId = (string) $this->p->repo()->meta($run->id, 'file');
+        $file = $this->p->files()->path($fileId);
+        $this->p->clock()->advance(3601);
+
+        $this->p->runner()->sweep();
+        self::assertFileExists($file);
+        self::assertSame(1, $this->p->files()->registry()[$fileId]['failures']);
+        self::assertSame([], \WPStub::fired('audiopost_recording_deleted'), 'no deletion is reported that did not happen');
+        $this->p->runner()->daily();
+        self::assertSame(2, $this->p->files()->registry()[$fileId]['failures']);
+        $failures = array_filter($this->logLines($run->id), static fn (string $l): bool => str_starts_with($l, 'could not delete audio file ' . $fileId));
+        self::assertCount(2, $failures);
+        self::assertStringContainsString('keep_recording_hours=1', (string) reset($failures));
+
+        $this->p->runner()->sweep();
+        self::assertFileDoesNotExist($file);
+        self::assertArrayNotHasKey($fileId, $this->p->files()->registry());
+        self::assertCount(3, array_filter($attempts, static fn (string $p): bool => $p === $file));
+        self::assertCount(1, \WPStub::fired('audiopost_recording_deleted'));
+        self::assertNotEmpty(array_filter($this->logLines($run->id), static fn (string $l): bool => str_starts_with($l, 'deleted audio file ' . $fileId)));
+    }
+
+    /** Fail closed: when the private directory cannot be protected, nothing is written to it. */
+    public function testUnprotectedDirectoryFailsClosed(): void
+    {
+        // A path under a regular file can never become a directory.
+        file_put_contents($this->uploads . '/not-a-dir', 'x');
+        $base = $this->uploads . '/not-a-dir/audio-to-post';
+        $files = new PrivateStorage($this->p->clock(), $base);
+        try {
+            $files->dir();
+            self::fail('expected storage_unwritable');
+        } catch (\IndianOpinion\AudioToPost\StateException $e) {
+            self::assertSame('storage_unwritable', $e->errorCode());
+        }
+    }
+
     /** T82: an unreferenced file is an orphan and is deleted only when due and older than 24 h. */
     public function testOrphans(): void
     {
@@ -212,7 +267,14 @@ final class SourcesRetentionTest extends WpTestCase
         $this->drain();
         $draft = $this->runOf($run->id)->draftIds[0];
         $att = $run->source->attachmentId();
-        Uninstaller::site();
+        $log = $this->uploads . '/php-error.log';
+        $before = ini_set('error_log', $log);
+        try {
+            Uninstaller::site();
+        } finally {
+            ini_set('error_log', (string) $before);
+        }
+        self::assertStringContainsString('under remove_recordings_on_uninstall', (string) file_get_contents($log), 'the uninstall removal is logged');
         self::assertNull(get_post($run->id));
         self::assertNotNull(get_post($draft));
         self::assertNotNull(get_post($att));

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace IndianOpinion\AudioToPost\WordPress;
 
+use IndianOpinion\AudioToPost\StateException;
+
 /**
  * Private files under `uploads/audio-to-post/` (section 6.1 item 4):
  * random 32-hex names, an index.php and a deny-all .htaccess. Audio
@@ -15,11 +17,28 @@ final class PrivateStorage
 {
     public const REGISTRY = 'audiopost_files';
     public const ORPHAN_MIN_AGE = 86400;
+    private const GUARDS = ['index.php' => "<?php\n// Silence is golden.\n", '.htaccess' => "Require all denied\nDeny from all\n"];
 
-    public function __construct(private readonly Clock $clock, private readonly ?string $baseDir = null)
+    /** @var \Closure(string): bool */
+    private \Closure $deleter;
+
+    /**
+     * @param (callable(string): bool)|null $deleter removes one file; tests inject failures
+     */
+    public function __construct(private readonly Clock $clock, private readonly ?string $baseDir = null, ?callable $deleter = null)
     {
+        $this->deleter = $deleter === null
+            ? static fn (string $path): bool => !is_file($path) || unlink($path)
+            : \Closure::fromCallable($deleter);
     }
 
+    /**
+     * The private directory, with its index.php and deny-all .htaccess.
+     * Fails closed: when the directory or its guard files cannot be
+     * written, nothing is stored in it.
+     *
+     * @throws StateException storage_unwritable
+     */
     public function dir(): string
     {
         if ($this->baseDir !== null) {
@@ -28,27 +47,32 @@ final class PrivateStorage
             $uploads = wp_upload_dir(null, false);
             $dir = rtrim((string) $uploads['basedir'], '/') . '/audio-to-post';
         }
-        if (!is_dir($dir)) {
-            wp_mkdir_p($dir);
-        }
-        foreach (['index.php' => "<?php\n// Silence is golden.\n", '.htaccess' => "Require all denied\nDeny from all\n"] as $name => $body) {
-            if (!is_file($dir . '/' . $name)) {
-                file_put_contents($dir . '/' . $name, $body);
-            }
-        }
+        self::guard($dir);
 
         return $dir;
     }
 
+    /** @throws StateException storage_unwritable */
     public function transcriptDir(): string
     {
         $dir = $this->dir() . '/transcripts';
-        if (!is_dir($dir)) {
-            wp_mkdir_p($dir);
-            file_put_contents($dir . '/index.php', "<?php\n// Silence is golden.\n");
-        }
+        self::guard($dir);
 
         return $dir;
+    }
+
+    /** @throws StateException storage_unwritable */
+    private static function guard(string $dir): void
+    {
+        if (!is_dir($dir) && !wp_mkdir_p($dir)) {
+            throw new StateException('storage_unwritable', 'The private directory cannot be created: ' . $dir);
+        }
+        foreach (self::GUARDS as $name => $body) {
+            $file = $dir . '/' . $name;
+            if (!is_file($file) && file_put_contents($file, $body) !== strlen($body)) {
+                throw new StateException('storage_unwritable', 'The private directory cannot be protected (' . $name . ' not written): ' . $dir);
+            }
+        }
     }
 
     /** A new random file id (32 hex characters). */
@@ -175,6 +199,8 @@ final class PrivateStorage
         $now = $this->clock->now();
         $reg = $this->registry();
         $done = [];
+        $removed = [];
+        $failed = [];
         foreach ($reg as $id => $e) {
             if ($e['due'] === null || $e['due'] > $now) {
                 continue;
@@ -185,18 +211,28 @@ final class PrivateStorage
                 $done[] = ['id' => $id, 'run' => $e['run'], 'bytes' => $bytes, 'reason' => $e['reason'], 'due' => $e['due']];
                 continue;
             }
-            if (is_file($path) && !unlink($path)) {
-                $reg[$id]['failures']++;
-                $log($e['run'], sprintf('could not delete %s file %s (%d bytes, due %s); will retry', $e['kind'], $id, $bytes, gmdate('c', $e['due'])));
+            if (!($this->deleter)($path)) {
+                $failed[$id] = true;
+                $log($e['run'], sprintf('could not delete %s file %s (%d bytes, due %s under %s); will retry', $e['kind'], $id, $bytes, gmdate('c', $e['due']), $e['reason']));
                 continue;
             }
-            unset($reg[$id]);
+            $removed[$id] = true;
             $done[] = ['id' => $id, 'run' => $e['run'], 'bytes' => $bytes, 'reason' => $e['reason'], 'due' => $e['due']];
             $log($e['run'], sprintf('deleted %s file %s: %d bytes at %s, due %s under %s', $e['kind'], $id, $bytes, gmdate('c', $now), gmdate('c', $e['due']), $e['reason']));
             do_action('audiopost_recording_deleted', $runOf !== null && $e['run'] > 0 ? $runOf($e['run']) : null, $id, $bytes, $e['reason']);
         }
-        if (!$dryRun) {
-            $this->save($reg);
+        if (!$dryRun && ($removed !== [] || $failed !== [])) {
+            // Re-read: another process may have registered a file meanwhile.
+            $fresh = $this->registry();
+            foreach ($removed as $id => $_) {
+                unset($fresh[$id]);
+            }
+            foreach ($failed as $id => $_) {
+                if (isset($fresh[$id])) {
+                    $fresh[$id]['failures']++;
+                }
+            }
+            $this->save($fresh);
         }
         foreach ($this->orphans() as $o) {
             $due = $o['mtime'] + max(self::ORPHAN_MIN_AGE, $keepRecordingHours * 3600);
@@ -205,7 +241,7 @@ final class PrivateStorage
             }
             $reason = 'orphan, keep_recording_hours=' . $keepRecordingHours . ' (at least 24 h)';
             if (!$dryRun) {
-                if (!unlink($this->dir() . '/' . $o['id'])) {
+                if (!($this->deleter)($this->dir() . '/' . $o['id'])) {
                     $log(0, sprintf('could not delete orphan %s; will retry', $o['id']));
                     continue;
                 }
@@ -243,23 +279,43 @@ final class PrivateStorage
         return $out;
     }
 
-    /** Delete the whole directory (uninstall, only when the operator ticked it). */
-    public function removeAll(): void
+    /**
+     * Delete the whole directory (uninstall, only when the operator ticked
+     * "remove audio copies on uninstall"). Every audio file removed is
+     * reported through $log, as every other deletion is.
+     *
+     * @param callable(string): void $log
+     */
+    public function removeAll(callable $log): void
     {
         $dir = $this->dir();
+        $count = 0;
+        $bytes = 0;
         foreach (['transcripts', ''] as $sub) {
             $d = $sub === '' ? $dir : $dir . '/' . $sub;
             foreach (is_dir($d) ? (scandir($d) ?: []) : [] as $f) {
-                if ($f !== '.' && $f !== '..' && is_file($d . '/' . $f)) {
-                    unlink($d . '/' . $f);
+                $path = $d . '/' . $f;
+                if ($f === '.' || $f === '..' || !is_file($path)) {
+                    continue;
+                }
+                $size = (int) filesize($path);
+                if (!($this->deleter)($path)) {
+                    $log(sprintf('could not delete %s on uninstall', $path));
+                    continue;
+                }
+                if ($sub === '' && !isset(self::GUARDS[$f])) {
+                    $count++;
+                    $bytes += $size;
+                    $log(sprintf('deleted audio file %s: %d bytes on uninstall under remove_recordings_on_uninstall', $f, $size));
                 }
             }
         }
         foreach ([$dir . '/transcripts', $dir] as $d) {
-            if (is_dir($d)) {
+            if (is_dir($d) && (scandir($d) ?: []) === ['.', '..']) {
                 rmdir($d);
             }
         }
+        $log(sprintf('uninstall removed %d audio file(s), %d bytes, under remove_recordings_on_uninstall', $count, $bytes));
         delete_option(self::REGISTRY);
     }
 

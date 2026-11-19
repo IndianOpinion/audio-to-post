@@ -50,9 +50,12 @@ final class Uninstaller
         delete_post_meta_by_key('_audiopost_mode');
         delete_post_meta_by_key('_audiopost_review_notes');
         if ($removeAudio) {
-            $p->files()->removeAll();
+            // No run is left to carry the log line: it goes to the PHP error log.
+            $p->files()->removeAll(static function (string $line): void {
+                error_log('[audio-to-post] ' . $line);
+            });
         }
-        foreach ([Settings::OPTION, Settings::SECRETS, KillSwitch::OPTION, PrivateStorage::REGISTRY, AdapterRegistry::LIMITS_OPTION, Runner::HOLD_OPTION, 'audiopost_db_version', 'audiopost_ticks', 'audiopost_notice_cap', 'audiopost_notice_provider', 'audiopost_orphan_log'] as $o) {
+        foreach ([Settings::OPTION, Settings::SECRETS, KillSwitch::OPTION, PrivateStorage::REGISTRY, AdapterRegistry::LIMITS_OPTION, Runner::HOLD_OPTION, SpendGuard::HOLDS, UsageLedger::BUFFER, 'audiopost_db_version', 'audiopost_ticks', 'audiopost_notice_cap', 'audiopost_notice_provider', 'audiopost_orphan_log'] as $o) {
             delete_option($o);
         }
         $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE 'audiopost\\_lock\\_%' OR option_name LIKE 'audiopost\\_usage\\_%'");
