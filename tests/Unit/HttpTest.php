@@ -108,13 +108,45 @@ final class HttpTest extends TestCase
     {
         $http = new ScriptedHttp();
         $http->on('GET https://ok.example/r.mp3', static function (string $m, string $u, array $h): HttpResponse {
-            return isset($h['Range']) ? new HttpResponse(206, [], 'world') : new HttpResponse(200, [], 'hello world');
+            return isset($h['Range']) ? new HttpResponse(206, ['content-range' => 'bytes 6-10/11'], 'world') : new HttpResponse(200, [], 'hello world');
         });
         $dl = new Downloader($http, $this->guard());
         $dest = AudioFixtures::dir() . '/r.bin';
         file_put_contents($dest, 'hello ');
         $dl->download('https://ok.example/r.mp3', $dest, 100, 6);
         self::assertSame('hello world', file_get_contents($dest));
+    }
+
+    /** A 206 for a range other than the one asked for is never appended. */
+    public function testWrongRangeIsNotAppended(): void
+    {
+        $http = new ScriptedHttp();
+        $http->on('GET https://ok.example/r.mp3', new HttpResponse(206, ['content-range' => 'bytes 3-10/11'], 'lo world'));
+        $http->on('GET https://ok.example/w.mp3', new HttpResponse(206, ['content-range' => 'bytes 0-10/11'], 'hello world'));
+        $dl = new Downloader($http, $this->guard());
+        $dest = AudioFixtures::dir() . '/r2.bin';
+        file_put_contents($dest, 'hello ');
+        self::assertSame('fetch_failed', $this->code(static fn () => $dl->download('https://ok.example/r.mp3', $dest, 100, 6)));
+        self::assertSame('hello ', file_get_contents($dest), 'the partial copy is kept, not deleted');
+        self::assertFileDoesNotExist($dest . '.part');
+        // The whole file sent as a 206 from byte 0 replaces the partial copy.
+        $dl->download('https://ok.example/w.mp3', $dest, 100, 6);
+        self::assertSame('hello world', file_get_contents($dest));
+    }
+
+    /** T8 and T9: every hop is pinned to the addresses its own check resolved. */
+    public function testEveryHopIsPinnedToCheckedAddresses(): void
+    {
+        $http = new ScriptedHttp();
+        $http->on('GET https://a.example/x', new HttpResponse(302, ['location' => 'https://b.example:8080/y'], ''));
+        $http->on('GET https://b.example:8080/y', new HttpResponse(200, [], 'ok'));
+        $http->on('GET https://93.184.216.34/z', new HttpResponse(200, [], 'ok'));
+        $dl = new Downloader($http, $this->guard(['a.example' => ['93.184.216.34'], 'b.example' => ['93.184.216.35', '2606:2800:220:1::1']]));
+        $dl->text('https://a.example/x', 100);
+        self::assertSame(['host' => 'a.example', 'port' => 443, 'ips' => ['93.184.216.34']], $http->requests[0]['options']['pin']);
+        self::assertSame(['host' => 'b.example', 'port' => 8080, 'ips' => ['93.184.216.35', '2606:2800:220:1::1']], $http->requests[1]['options']['pin']);
+        $dl->text('https://93.184.216.34/z', 100);
+        self::assertArrayNotHasKey('pin', $http->requests[2]['options'], 'an address literal needs no pin');
     }
 
     /** T2: a 100 MB download streams to disk without holding the file in memory. */

@@ -69,7 +69,14 @@ final class Downloader
             self::remove($part);
             throw new SourceException('too_large', 'The file is larger than the size limit.');
         }
-        if ($resumeFrom > 0 && $res->status === 206 && is_file($dest)) {
+        $rangeStart = preg_match('#^bytes (\d+)-#', (string) $res->header('content-range'), $m) === 1 ? (int) $m[1] : null;
+        if ($res->status === 206 && $rangeStart !== $resumeFrom && $rangeStart !== 0) {
+            // Not the tail we asked for, nor the whole file: appending it
+            // would corrupt the copy. Keep what we have and try again later.
+            self::remove($part);
+            throw new SourceException('fetch_failed', 'The server sent a different byte range than the one asked for.');
+        }
+        if ($resumeFrom > 0 && $res->status === 206 && $rangeStart === $resumeFrom && is_file($dest)) {
             $out = fopen($dest, 'ab');
             $in = fopen($part, 'rb');
             if ($out === false || $in === false) {
@@ -124,10 +131,14 @@ final class Downloader
         $current = $url;
         $previous = null;
         for ($hop = 0; $hop <= self::MAX_REDIRECTS; $hop++) {
-            $this->guard->check($current, $previous);
+            $ips = $this->guard->check($current, $previous);
             try {
-                /** @var array{timeout?: int|float, safe?: bool, stream_to?: string, limit_bytes?: int} $opts */
+                /** @var array{timeout?: int|float, safe?: bool, stream_to?: string, limit_bytes?: int, pin?: array{host: string, port: int, ips: list<string>}} $opts */
                 $opts = ['safe' => true] + $options;
+                $pin = self::pin($current, $ips);
+                if ($pin !== null) {
+                    $opts['pin'] = $pin;
+                }
                 $res = $this->http->request($method, $current, $headers, null, $opts);
             } catch (TransportError $e) {
                 throw new SourceException('fetch_failed', ($e->timeout ? 'Timed out: ' : 'Connection error: ') . $e->getMessage(), $e);
@@ -147,6 +158,27 @@ final class Downloader
             return [$res, $current];
         }
         throw new SourceException('unsafe_url', 'Too many redirects (more than ' . self::MAX_REDIRECTS . ').');
+    }
+
+    /**
+     * Pin a host name to the addresses the guard checked (DNS rebinding).
+     *
+     * @param list<string> $ips
+     *
+     * @return array{host: string, port: int, ips: list<string>}|null
+     */
+    private static function pin(string $url, array $ips): ?array
+    {
+        $p = parse_url($url);
+        if (!is_array($p) || !isset($p['host'], $p['scheme']) || $ips === []) {
+            return null;
+        }
+        $host = trim($p['host'], '[]');
+        if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+            return null;
+        }
+
+        return ['host' => $host, 'port' => (int) ($p['port'] ?? (strtolower($p['scheme']) === 'https' ? 443 : 80)), 'ips' => $ips];
     }
 
     private static function result(HttpResponse $res, string $final, int $bytes, string $body = ''): FetchResult

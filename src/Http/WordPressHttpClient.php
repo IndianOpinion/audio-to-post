@@ -30,7 +30,25 @@ final class WordPressHttpClient implements HttpClient
         if (isset($options['limit_bytes'])) {
             $args['limit_response_size'] = $options['limit_bytes'];
         }
-        $res = ($options['safe'] ?? false) ? wp_safe_remote_request($url, $args) : wp_remote_request($url, $args);
+        $pin = null;
+        if (isset($options['pin']) && defined('CURLOPT_RESOLVE')) {
+            // Connect to the addresses the guard checked, not to whatever a
+            // second DNS answer says (DNS rebinding). The cURL transport is
+            // WordPress's default; other transports still get the safe-request
+            // check of their own.
+            $entry = $options['pin']['host'] . ':' . $options['pin']['port'] . ':' . implode(',', array_map(static fn (string $ip): string => str_contains($ip, ':') ? '[' . $ip . ']' : $ip, $options['pin']['ips']));
+            $pin = static function ($handle) use ($entry): void {
+                curl_setopt($handle, CURLOPT_RESOLVE, [$entry]);
+            };
+            add_action('http_api_curl', $pin, 10, 1);
+        }
+        try {
+            $res = ($options['safe'] ?? false) ? wp_safe_remote_request($url, $args) : wp_remote_request($url, $args);
+        } finally {
+            if ($pin !== null) {
+                remove_action('http_api_curl', $pin, 10);
+            }
+        }
         if (is_wp_error($res)) {
             $msg = $res->get_error_message();
             throw new TransportError($msg, stripos($msg, 'timed out') !== false || stripos($msg, 'timeout') !== false);

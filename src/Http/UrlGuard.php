@@ -27,9 +27,15 @@ final class UrlGuard
     }
 
     /**
+     * Returns the public addresses the host resolved to, so the request
+     * can be pinned to them (no second lookup that could answer
+     * differently).
+     *
+     * @return list<string>
+     *
      * @throws SourceException unsafe_url, source_unavailable
      */
-    public function check(string $url, ?string $from = null): void
+    public function check(string $url, ?string $from = null): array
     {
         $parts = parse_url($url);
         if (!is_array($parts) || !isset($parts['scheme'], $parts['host'])) {
@@ -78,6 +84,8 @@ final class UrlGuard
                 throw new SourceException('unsafe_url', 'The link points at a private or reserved address.');
             }
         }
+
+        return array_values($ips);
     }
 
     public static function isPublic(string $ip): bool
